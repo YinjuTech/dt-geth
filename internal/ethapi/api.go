@@ -1145,6 +1145,81 @@ func doCall(ctx context.Context, b Backend, args TransactionArgs, state *state.S
 	return result, nil
 }
 
+// BatchCallConfig is the config object to be passed to eth_batchCall.
+type BatchCallConfig struct {
+	Block          rpc.BlockNumberOrHash
+	StateOverrides *StateOverride
+	Calls          []BatchCallArgs
+}
+
+// BatchCallArgs is the object specifying each call within eth_batchCall. It
+// extends TransactionArgs with the list of block metadata overrides.
+type BatchCallArgs struct {
+	TransactionArgs
+	BlockOverrides *BlockOverrides
+}
+
+// CallResult is the result of one call.
+type CallResult struct {
+	Return hexutil.Bytes
+	Error  error
+}
+
+// BatchCall executes a series of transactions on the state of a given block as base.
+// The base state can be overridden once before transactions are executed.
+//
+// Additionally, each call can override block context fields such as number.
+//
+// Note, this function doesn't make any changes in the state/blockchain and is
+// useful to execute and retrieve values.
+func (s *BlockChainAPI) BatchCall(ctx context.Context, config BatchCallConfig) ([]CallResult, error) {
+	state, header, err := s.b.StateAndHeaderByNumberOrHash(ctx, config.Block)
+	if state == nil || err != nil {
+		return nil, err
+	}
+	// State overrides are applied once before all calls
+	if err := config.StateOverrides.Apply(state); err != nil {
+		return nil, err
+	}
+	// Setup context so it may be cancelled before the calls completed
+	// or, in case of unmetered gas, setup a context with a timeout.
+	var (
+		cancel  context.CancelFunc
+		timeout = s.b.RPCEVMTimeout()
+	)
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+	var (
+		results []CallResult
+		// Each tx and all the series of txes shouldn't consume more gas than cap
+		globalGasCap = s.b.RPCGasCap()
+	)
+	for i, call := range config.Calls {
+		// blockContext := core.NewEVMBlockContext(header, NewChainContext(ctx, s.b), nil)
+		// if call.BlockOverrides != nil {			call.BlockOverrides.Apply(&blockContext)
+		// }
+		stateOverrides := config.StateOverrides
+		if i != 0 {
+			stateOverrides = nil
+		}
+		result, err := doCall(ctx, s.b, call.TransactionArgs, state, header, stateOverrides, call.BlockOverrides, timeout, globalGasCap)
+		if err != nil {
+			return nil, err
+		}
+		// If the result contains a revert reason, try to unpack it.
+		if len(result.Revert()) > 0 {
+			result.Err = newRevertError(result.Revert())
+		}
+		results = append(results, CallResult{Return: result.Return(), Error: result.Err})
+	}
+	return results, nil
+}
 func DoCall(ctx context.Context, b Backend, args TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, overrides *StateOverride, blockOverrides *BlockOverrides, timeout time.Duration, globalGasCap uint64) (*core.ExecutionResult, error) {
 	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
 

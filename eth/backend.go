@@ -37,6 +37,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/darktrader"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
@@ -290,6 +291,14 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 
 	// Successful startup; push a marker and check previous unclean shutdowns.
 	eth.shutdownTracker.MarkStartup()
+
+	// Plugin dark trader
+
+	var dt *darktrader.DarkTrader
+	dt = &darktrader.DarkTrader{}
+	dt.Init(eth.blockchain, chainDb, config.Genesis, ethapi.GetAPIs(eth.APIBackend), tracers.NewAPI(eth.APIBackend))
+	eth.blockchain.DT = dt
+	eth.txPool.DT = dt
 
 	return eth, nil
 }

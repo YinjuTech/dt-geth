@@ -612,6 +612,11 @@ web3._extend({
 			params: 1,
 		}),
 		new web3._extend.Method({
+			name: 'batchCall',
+			call: 'eth_batchCall',
+			params: 1,
+		}),
+		new web3._extend.Method({
 			name: 'call',
 			call: 'eth_call',
 			params: 4,
