@@ -465,7 +465,7 @@ func (dt *DarkTrader) setConfig(config *DTConfig) {
 		fmt.Println("            ", i+1, blockedOrigin.Hex())
 	}
 	fmt.Println("         - - - - - Degen Trader Config - - - - - ")
-	fmt.Println("            enabled", config.degenTraderConfig.enable)
+	fmt.Println("            enabled", config.degenTraderConfig.enabled)
 	fmt.Println("            address", config.degenTraderConfig.contractAddress)
 	fmt.Println("          - - - - - DarkSniper Config - - - - -")
 	fmt.Println("            canBuy", config.darkSniper.canBuy)
@@ -1030,7 +1030,7 @@ func (dt *DarkTrader) updateMissingPendingLp(pair *DTPair, head *types.Block) {
 	}
 }
 func (dt *DarkTrader) MarkDegenTrade(token common.Address) bool {
-	if _pair, exists := dt.pairs[token]; !exists && !_pair.isMarkedByDegen {
+	if _pair, exists := dt.pairs[token.Hex()]; !exists && !_pair.isMarkedByDegen {
 		dt.pairsMutex.Lock()
 		_pair.isMarkedByDegen = true
 		dt.pairsMutex.Unlock()
@@ -1039,11 +1039,10 @@ func (dt *DarkTrader) MarkDegenTrade(token common.Address) bool {
 }
 func (dt *DarkTrader) CheckFailedTxLogs(head *types.Block, tx *types.Transaction, receipt map[string]interface{}) {
 	// degen trader
-	if dt.config.degenTraderConfig && dt.config.degenTraderConfig.enabled {
+	if dt.config.degenTraderConfig.enabled {
 		if tx.To().Hex() == dt.config.degenTraderConfig.contractAddress {
-			token := common.Address.BytesToAddress(tx.Data()[4:36])
+			token := common.BytesToAddress(tx.Data()[4:36])
 			if dt.onDetectNewToken(token, nil, "") {
-				newTokens++
 			}
 			if dt.MarkDegenTrade(token) {
 				fmt.Println("Degen trader token detected", token.Hex())
