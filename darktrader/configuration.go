@@ -45,7 +45,7 @@ type PairBoughtEvent struct {
 
 var ctx = context.Background()
 
-const CONFIG_PATH string = "/root/dt.config.json"
+const CONFIG_PATH string = "/home/ubuntu/darktrader/dt-utils/darktrader.config.json"
 
 func NewConfiguration(dt *DarkTrader) *Configuration {
 	conf := &Configuration{

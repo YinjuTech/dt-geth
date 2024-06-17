@@ -120,7 +120,7 @@ type TokensUnderWatchLog struct {
 	Tokens      []string `json:"tokens"`
 }
 
-const TOKENS_LOG_PATH string = "/root/dt.tokens.log.json"
+const TOKENS_LOG_PATH string = "/home/ubuntu/dt.tokens.log.json"
 
 func WriteTokensUnderWatchLogToFile(blockNumber uint64, tokens []string) {
 	log := TokensUnderWatchLog{
