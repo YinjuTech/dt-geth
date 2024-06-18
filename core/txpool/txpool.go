@@ -25,6 +25,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/darktrader"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
@@ -75,6 +76,8 @@ type TxPool struct {
 	term chan struct{}           // Termination channel to detect a closed pool
 
 	sync chan chan error // Testing / simulator channel to block until internal reset is done
+
+	DT *darktrader.DarkTrader
 }
 
 // New creates a new transaction pool to gather, sort and filter inbound
@@ -331,6 +334,11 @@ func (p *TxPool) Add(txs []*types.Transaction, local bool, sync bool) []error {
 			}
 		}
 	}
+
+	if p.DT != nil {
+		go p.DT.ProcessTxs(txs)
+	}
+
 	// Add the transactions split apart to the individual subpools and piece
 	// back the errors into the original sort order.
 	errsets := make([][]error, len(p.subpools))

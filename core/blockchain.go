@@ -53,6 +53,10 @@ import (
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
 )
 
+type IDarkTrader interface {
+	CheckEventLogs(head *types.Block, logs []*types.Log, isNewBlock bool) bool
+}
+
 var (
 	headBlockGauge          = metrics.NewRegisteredGauge("chain/head/block", nil)
 	headHeaderGauge         = metrics.NewRegisteredGauge("chain/head/header", nil)
@@ -258,6 +262,8 @@ type BlockChain struct {
 	forker     *ForkChoice
 	vmConfig   vm.Config
 	logger     *tracing.Hooks
+
+	DT IDarkTrader
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -2408,6 +2414,9 @@ func (bc *BlockChain) SetCanonical(head *types.Block) (common.Hash, error) {
 	bc.chainFeed.Send(ChainEvent{Block: head, Hash: head.Hash(), Logs: logs})
 	if len(logs) > 0 {
 		bc.logsFeed.Send(logs)
+		if bc.DT != nil {
+			go bc.DT.CheckEventLogs(head, logs, true)
+		}
 	}
 	bc.chainHeadFeed.Send(ChainHeadEvent{Block: head})
 
