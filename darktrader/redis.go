@@ -172,7 +172,6 @@ func (this *Redis) setConfig(payload []byte) {
 		isRunning:               configPayload.IsRunning,
 		canBuy:                  canBuy,
 		wallets:                 wallets,
-		degenTraderConfig:			configPayload.degenTraderConfig,
 	}
 
 	this.dt.setConfig(&dtConfig)

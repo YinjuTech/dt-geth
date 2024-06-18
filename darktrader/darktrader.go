@@ -100,7 +100,7 @@ type DTPair struct {
 	autoSellEnabled           bool
 	buyInfo                   *TokenBuyInfo
 	isHiddenSniperToken       bool
-	isMarkedByDegen			  bool
+	isMarkedByDegen           bool
 }
 
 type DTAccount struct {
@@ -184,8 +184,8 @@ type SpecialModeConfig struct {
 	maxBuyCount            uint64
 }
 type DegenTraderConfig struct {
-	enabled                bool
-	contractAddress		   string
+	enabled         bool
+	contractAddress string
 }
 type DTConfig struct {
 	minEthReserve              *big.Int
@@ -231,11 +231,11 @@ type DTConfig struct {
 		3 - use [defaultBaseTipMax * 10 - baseFee] as tip for all
 		4 - use multi tip mode
 	*/
-	tipMode        int
-	multiTipModes  []MultiTipModeConfig
-	specialModes   []SpecialModeConfig
-	broadcastCount int
-	blockedOrigins []*common.Address
+	tipMode           int
+	multiTipModes     []MultiTipModeConfig
+	specialModes      []SpecialModeConfig
+	broadcastCount    int
+	blockedOrigins    []*common.Address
 	degenTraderConfig *DegenTraderConfig
 }
 
@@ -276,10 +276,11 @@ type DarkTrader struct {
 
 	resumeEnabled bool
 
-	darkSniper   *DarkSniper
-	darkSlayer   *DarkSlayer
-	darkJumper   *DarkJumper
-	darkInfinite *DarkInfinite
+	darkSniper    *DarkSniper
+	darkSlayer    *DarkSlayer
+	darkJumper    *DarkJumper
+	darkInfinite  *DarkInfinite
+	degenDetector *DegenDetector
 }
 
 func (dt *DarkTrader) Init(_bc blockChain, _db ethdb.Database, genesis *core.Genesis, _rpcApis []rpc.API, _tracerApi *tracers.API) {
@@ -335,6 +336,7 @@ func (dt *DarkTrader) Init(_bc blockChain, _db ethdb.Database, genesis *core.Gen
 	dt.darkJumper = NewDarkJumper(dt.conf, dt.erc20, dt.uniswapv2, dt.scamchecker, dt.bc, dt.bcApi, dt.txApi, dt.darkSlayer)
 	dt.darkSniper = NewDarkSniper(dt.conf, dt.erc20, dt.uniswapv2, dt.scamchecker, dt.bc, dt.bcApi, dt.txApi, dt.darkSlayer, dt.darkJumper)
 	dt.darkInfinite = NewDarkInfinite(dt.bcApi)
+	dt.degenDetector = NewDegenDetector(dt.erc20, dt.uniswapv2, dt.txApi)
 	dt.initRedis()
 
 	dt.resumeEnabled = true
@@ -345,29 +347,29 @@ func (dt *DarkTrader) Init(_bc blockChain, _db ethdb.Database, genesis *core.Gen
 }
 
 func (dt *DarkTrader) loadTokens() {
-	// blockNumber, tokens := ReadTokensUnderWatchLogFromFile()
+	blockNumber, tokens := ReadTokensUnderWatchLogFromFile()
 
-	// if tokens != nil {
-	// 	fmt.Println("Load ", len(tokens), " saved tokens")
-	// 	for _, token := range tokens {
-	// 		dt.onDetectNewToken(common.HexToAddress(token), nil, "")
-	// 	}
-	// }
-	// blockNumber = 18182461
-	// if blockNumber != 0 {
-	// 	for {
-	// 		block := dt.bc.GetBlockByNumber(blockNumber)
+	if tokens != nil {
+		fmt.Println("Load ", len(tokens), " saved tokens")
+		for _, token := range tokens {
+			dt.onDetectNewToken(common.HexToAddress(token), nil, "")
+		}
+	}
+	blockNumber = 20114110
+	if blockNumber != 0 {
+		// 	for {
+		// 		block := dt.bc.GetBlockByNumber(blockNumber)
 
-	// 		if block != nil {
-	// 			dt.CheckEventLogs(block, []*types.Log{}, false)
-	// 		}
+		// 		if block != nil {
+		// 			dt.CheckEventLogs(block, []*types.Log{}, false)
+		// 		}
 
-	// 		if blockNumber >= dt.bc.CurrentHeader().Number.Uint64() {
-	// 			break
-	// 		}
-	// 		blockNumber++
-	// 	}
-	// }
+		// 		if blockNumber >= dt.bc.CurrentHeader().Number.Uint64() {
+		// 			break
+		// 		}
+		// 		blockNumber++
+		// 	}
+	}
 	dt.setToRedis("channel:tokens_read", "")
 }
 
@@ -515,6 +517,7 @@ func (dt *DarkTrader) setConfig(config *DTConfig) {
 	dt.darkSniper.SetConfig(config)
 	dt.darkSlayer.SetConfig(config)
 	dt.darkJumper.SetConfig(config)
+	dt.degenDetector.SetConfig(config)
 
 	if (dt.config == nil || dt.config.isRunning) && !config.isRunning {
 		dt.stop()
@@ -1029,27 +1032,6 @@ func (dt *DarkTrader) updateMissingPendingLp(pair *DTPair, head *types.Block) {
 		}
 	}
 }
-func (dt *DarkTrader) MarkDegenTrade(token common.Address) bool {
-	if _pair, exists := dt.pairs[token.Hex()]; !exists && !_pair.isMarkedByDegen {
-		dt.pairsMutex.Lock()
-		_pair.isMarkedByDegen = true
-		dt.pairsMutex.Unlock()
-	}
-	return false
-}
-func (dt *DarkTrader) CheckFailedTxLogs(head *types.Block, tx *types.Transaction, receipt map[string]interface{}) {
-	// degen trader
-	if dt.config.degenTraderConfig.enabled {
-		if tx.To().Hex() == dt.config.degenTraderConfig.contractAddress {
-			token := common.BytesToAddress(tx.Data()[4:36])
-			if dt.onDetectNewToken(token, nil, "") {
-			}
-			if dt.MarkDegenTrade(token) {
-				fmt.Println("Degen trader token detected", token.Hex())
-			}
-		}
-	}
-}
 func (dt *DarkTrader) CheckEventLogs(head *types.Block, blkLogs []*types.Log, isNewBlock bool) bool {
 	if !dt.config.isRunning {
 		return false
@@ -1063,11 +1045,6 @@ func (dt *DarkTrader) CheckEventLogs(head *types.Block, blkLogs []*types.Log, is
 	for _, tx := range txs {
 		receipt, err := dt.txApi.GetTransactionReceipt(context.Background(), tx.Hash())
 		if err != nil {
-			continue
-		}
-		txStatus, exists := receipt["status"]
-		if exists && uint(txStatus.(hexutil.Uint)) != 1 {
-			dt.CheckFailedTxLogs(head, tx, receipt)
 			continue
 		}
 
@@ -1155,6 +1132,7 @@ func (dt *DarkTrader) CheckEventLogs(head *types.Block, blkLogs []*types.Log, is
 		go dt.darkSniper.CheckEventLogs(head, blkLogs)
 		go dt.darkSlayer.CheckEventLogs(head, blkLogs)
 		go dt.darkJumper.CheckEventLogs(head, blkLogs)
+		go dt.degenDetector.CheckEventLogs(head, blkLogs)
 	}
 
 	return true
@@ -1207,6 +1185,7 @@ func (dt *DarkTrader) onDetectNewToken(token common.Address, origin *common.Addr
 		priceIncreaseTimesInitial: 1,
 		pairMutex:                 sync.RWMutex{},
 		triggerTxMutex:            sync.RWMutex{},
+		isMarkedByDegen:           false,
 	}
 
 	dt.addNewPair(&objPair)
