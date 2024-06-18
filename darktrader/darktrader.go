@@ -720,6 +720,8 @@ func (dt *DarkTrader) processPendingTxForPair(tx *types.Transaction) bool {
 		pair.triggerTx = tx
 	}
 
+	dt.degenDetector.onDetectPendingTxForToken(tx.To(), tx)
+
 	// try tx
 	// pair.triggerTxMutex.Lock()
 	// _, err := dt.erc20.CallTx(tx, nil, rpc.PendingBlockNumber, true)
@@ -799,6 +801,9 @@ func (dt *DarkTrader) processPendingAddLiquidity(tx *types.Transaction) bool {
 		}
 		return false
 	}
+
+	dt.degenDetector.onDetectPendingInitTrade(token, baseToken, tokenReserve, baseReserve, tx)
+
 	if pair, exists = dt.pairs[token.Hex()]; !exists {
 		return false
 	}
@@ -863,6 +868,9 @@ func (dt *DarkTrader) processPendingOpenTrading(tx *types.Transaction) bool {
 	if err != nil {
 		return false
 	}
+
+	dt.degenDetector.onDetectPendingInitTrade(pair.token, pair.baseToken, tokenReserve, baseReserve, tx)
+
 	pair.tokenReserve = tokenReserve
 	pair.baseReserve = baseReserve
 	pair.initialTokenReserve = tokenReserve
@@ -1120,9 +1128,10 @@ func (dt *DarkTrader) CheckEventLogs(head *types.Block, blkLogs []*types.Log, is
 	sniperTokensCount := len(dt.darkSniper.tokens)
 	slayerTokensCount := len(dt.darkSlayer.tokens)
 	jumperTokensCount := len(dt.darkJumper.tokens)
+	degenTokensCount := len(dt.degenDetector.tokens)
 	nextBaseFee := CalcNextBaseFee(head.Header())
 
-	go PrintPairsInfoAtNewBlock(pairsToShow, dt.tokens, blkNo, blkTime, newTokens, sniperTokensCount, slayerTokensCount, jumperTokensCount, nextBaseFee)
+	go PrintPairsInfoAtNewBlock(pairsToShow, dt.tokens, blkNo, blkTime, newTokens, sniperTokensCount, slayerTokensCount, jumperTokensCount, degenTokensCount, nextBaseFee)
 
 	if dt.resumeEnabled && blkNo.Int64()%20 == 0 {
 		go WriteTokensUnderWatchLogToFile(blkNo.Uint64(), dt.tokens)

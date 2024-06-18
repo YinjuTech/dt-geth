@@ -86,10 +86,10 @@ func sprintPairInfo(token []interface{}) string {
 	return tokenInfo + " " + sprintSwapCounts(token[6].(int), token[7].(int), token[8].(int), token[10].(int), totalSwapCountDetectedInclusiveFails) + " " + LogFcBwOb.Sprintf("[Res]: %d, %.2f", token[4].(*big.Int), ViewableEthAmount(token[5].(*big.Int))) + " " + blkNo
 }
 
-func PrintPairsInfoAtNewBlock(tokens [][]interface{}, totalTokens []string, blkNo *big.Int, blkTime time.Time, newTokens int, sniperTokensCount int, slayerTokenCount int, jumperTokensCount int, nextBaseFee *big.Int) {
+func PrintPairsInfoAtNewBlock(tokens [][]interface{}, totalTokens []string, blkNo *big.Int, blkTime time.Time, newTokens int, sniperTokensCount int, slayerTokenCount int, jumperTokensCount int, degenTokensCount int, nextBaseFee *big.Int) {
 	nextBaseFeeFloat, _ := ethUnit.NewWei(nextBaseFee).GWei().Float64()
 	logs := []string{
-		LogFwBbOb.Sprintf("New Blk #(%d) at %s, nextBaseFee: %.9f", blkNo, blkTime, nextBaseFeeFloat) + "  " + LogFbBwOb.Sprintf("[Trader#]: %d (+%d), [Sniper#]: %d, [Jumper#]: %d, [Slayer#]: %d", len(totalTokens), newTokens, sniperTokensCount, jumperTokensCount, slayerTokenCount),
+		LogFwBbOb.Sprintf("New Blk #(%d) at %s, nextBaseFee: %.9f", blkNo, blkTime, nextBaseFeeFloat) + "  " + LogFbBwOb.Sprintf("[Trader#]: %d (+%d), [Sniper#]: %d, [Jumper#]: %d, [Slayer#]: %d, [Degen#]: %d", len(totalTokens), newTokens, sniperTokensCount, jumperTokensCount, slayerTokenCount, degenTokensCount),
 	}
 
 	if len(tokens) > 0 {

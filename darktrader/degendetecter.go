@@ -141,3 +141,81 @@ func (dd *DegenDetector) addNewPair(pair *DTPair) {
 		_pair.originName = pair.originName
 	}
 }
+
+func (dd *DegenDetector) updatePairInfo(pair *DTPair) {
+	if pair.tokenReserve.Cmp(big.NewInt(0)) == 0 || pair.baseReserve.Cmp(big.NewInt(0)) == 0 {
+		baseReserve, tokenReserve, err := dd.erc20.GetPairReserves(
+			pair.address,
+			pair.baseToken,
+			pair.token,
+			rpc.LatestBlockNumber,
+		)
+
+		if err != nil || baseReserve.Cmp(big.NewInt(0)) == 0 || tokenReserve.Cmp(big.NewInt(0)) == 0 {
+
+			if pair.triggerTx != nil {
+				txs := []*types.Transaction{pair.triggerTx}
+				baseReserve, tokenReserve, err, _ = dd.erc20.GetPairReservesAfterTxs(
+					pair.address,
+					pair.baseToken,
+					pair.token,
+					txs,
+					rpc.LatestBlockNumber,
+					true,
+				)
+			} else {
+				baseReserve, tokenReserve, err = dd.erc20.GetPairReserves(
+					pair.address,
+					pair.baseToken,
+					pair.token,
+					rpc.PendingBlockNumber,
+				)
+			}
+			if err != nil || baseReserve.Cmp(big.NewInt(0)) == 0 && tokenReserve.Cmp(big.NewInt(0)) == 0 {
+				return
+			}
+		}
+
+		pair.tokenReserve = tokenReserve
+		pair.baseReserve = baseReserve
+		pair.initialTokenReserve = tokenReserve
+		pair.initialBaseReserve = baseReserve
+	}
+	pair.initialPrice = new(big.Float).Quo(
+		new(big.Float).SetInt(pair.baseReserve),
+		new(big.Float).SetInt(pair.tokenReserve),
+	)
+}
+
+func (dd *DegenDetector) onDetectPendingInitTrade(token *common.Address, baseToken *common.Address, tokenReserve *big.Int, baseReserve *big.Int, tx *types.Transaction) {
+	_pair, exists := dd.pairs[token.Hex()]
+	if !exists {
+		return
+	}
+
+	if tx != nil {
+		_pair.triggerTx = tx
+	}
+	if baseToken != nil {
+		_pair.baseToken = baseToken
+	}
+	if tokenReserve != nil {
+		_pair.tokenReserve = tokenReserve
+	}
+	if baseReserve != nil {
+		_pair.baseReserve = baseReserve
+	}
+
+	dd.updatePairInfo(_pair)
+}
+
+func (dd *DegenDetector) onDetectPendingTxForToken(token *common.Address, tx *types.Transaction) {
+	_pair, exists := dd.pairs[token.Hex()]
+	if !exists {
+		return
+	}
+	_pair.triggerTx = tx
+	dd.updatePairInfo(_pair)
+
+	dd.onDetectPendingInitTrade(token, nil, nil, nil, tx)
+}
