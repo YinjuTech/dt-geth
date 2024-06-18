@@ -12,28 +12,28 @@ import (
 func TestSimulateSanitizeBlockOrder(t *testing.T) {
 	for i, tc := range []struct {
 		baseNumber  int
-		blocks      []simBlock
+		blocks      []SimBlock
 		expectedLen int
 		err         string
 	}{
 		{
 			baseNumber:  10,
-			blocks:      []simBlock{{}, {}, {}},
+			blocks:      []SimBlock{{}, {}, {}},
 			expectedLen: 3,
 		},
 		{
 			baseNumber:  10,
-			blocks:      []simBlock{{BlockOverrides: &BlockOverrides{Number: newInt(13)}}, {}},
+			blocks:      []SimBlock{{BlockOverrides: &BlockOverrides{Number: newInt(13)}}, {}},
 			expectedLen: 4,
 		},
 		{
 			baseNumber:  10,
-			blocks:      []simBlock{{BlockOverrides: &BlockOverrides{Number: newInt(11)}}, {BlockOverrides: &BlockOverrides{Number: newInt(14)}}, {}},
+			blocks:      []SimBlock{{BlockOverrides: &BlockOverrides{Number: newInt(11)}}, {BlockOverrides: &BlockOverrides{Number: newInt(14)}}, {}},
 			expectedLen: 5,
 		},
 		{
 			baseNumber: 10,
-			blocks:     []simBlock{{BlockOverrides: &BlockOverrides{Number: newInt(13)}}, {BlockOverrides: &BlockOverrides{Number: newInt(12)}}},
+			blocks:     []SimBlock{{BlockOverrides: &BlockOverrides{Number: newInt(13)}}, {BlockOverrides: &BlockOverrides{Number: newInt(12)}}},
 			err:        "block numbers must be in order: 12 <= 13",
 		},
 	} {

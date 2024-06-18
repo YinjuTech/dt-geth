@@ -441,7 +441,7 @@ func (this *Erc20) getRpcBlockNumber(blockNumber *big.Int) rpc.BlockNumber {
 	return blockNr
 }
 
-func (this *Erc20) BuildBatchCallArgs(tx *types.Transaction, ignoreGasFee bool) ethapi.BatchCallArgs {
+func (this *Erc20) BuildBatchCallArgs(tx *types.Transaction, ignoreGasFee bool) ethapi.TransactionArgs {
 	chainID := hexutil.Big(*tx.ChainId())
 	from, _ := GetFrom(tx)
 	value := hexutil.Big(*tx.Value())
@@ -469,9 +469,7 @@ func (this *Erc20) BuildBatchCallArgs(tx *types.Transaction, ignoreGasFee bool) 
 		}
 	}
 
-	return ethapi.BatchCallArgs{
-		TransactionArgs: txArg,
-	}
+	return txArg
 }
 
 func (this *Erc20) CallTx(tx *types.Transaction, triggerTx *types.Transaction, blockNumber rpc.BlockNumber, considerGasPrice bool) (hexutil.Bytes, error) {
@@ -514,24 +512,29 @@ func (this *Erc20) CallTx(tx *types.Transaction, triggerTx *types.Transaction, b
 
 		return output, err
 	} else {
-		var batchCallConfig = ethapi.BatchCallConfig{
-			Block: rpc.BlockNumberOrHashWithNumber(blockNumber),
-			Calls: make([]ethapi.BatchCallArgs, 2),
+		var batchCallConfig = ethapi.SimOpts{
+			BlockStateCalls:        make([]ethapi.SimBlock, 1),
+			TraceTransfers:         false,
+			Validation:             false,
+			ReturnFullTransactions: true,
 		}
 
 		from, _ := GetFrom(triggerTx)
 		triggerNonce := hexutil.Uint64(triggerTx.Nonce())
 		value := hexutil.Big(*triggerTx.Value())
 		input := hexutil.Bytes(triggerTx.Data())
-		batchCallConfig.Calls[0] = ethapi.BatchCallArgs{
-			TransactionArgs: ethapi.TransactionArgs{
-				ChainID: &chainID,
-				From:    &from,
-				To:      triggerTx.To(),
-				Value:   &value,
-				Input:   &input,
-				Nonce:   &triggerNonce,
-			},
+		batchCallConfig.BlockStateCalls[0] = ethapi.SimBlock{
+			BlockOverrides: nil,
+			StateOverrides: nil,
+			Calls:          make([]ethapi.TransactionArgs, 2),
+		}
+		batchCallConfig.BlockStateCalls[0].Calls[0] = ethapi.TransactionArgs{
+			ChainID: &chainID,
+			From:    &from,
+			To:      triggerTx.To(),
+			Value:   &value,
+			Input:   &input,
+			Nonce:   &triggerNonce,
 		}
 
 		// 1
@@ -540,74 +543,77 @@ func (this *Erc20) CallTx(tx *types.Transaction, triggerTx *types.Transaction, b
 		input = hexutil.Bytes(tx.Data())
 		gas := tx.Gas()
 
-		batchCallConfig.Calls[1] = ethapi.BatchCallArgs{
-			TransactionArgs: ethapi.TransactionArgs{
-				ChainID: &chainID,
-				From:    &from,
-				To:      tx.To(),
-				Value:   &value,
-				Input:   &input,
-				Gas:     (*hexutil.Uint64)(&gas),
-			},
+		batchCallConfig.BlockStateCalls[0].Calls[1] = ethapi.TransactionArgs{
+			ChainID: &chainID,
+			From:    &from,
+			To:      tx.To(),
+			Value:   &value,
+			Input:   &input,
+			Gas:     (*hexutil.Uint64)(&gas),
 		}
+
 		if considerGasPrice {
 			if tx.GasPrice() != nil {
 				gasPrice := hexutil.Big(*tx.GasPrice())
-				batchCallConfig.Calls[1].GasPrice = &gasPrice
+				batchCallConfig.BlockStateCalls[0].Calls[1].GasPrice = &gasPrice
 			} else {
 				maxFeePerGas := hexutil.Big(*new(big.Int).Add(tx.GasFeeCap(), tx.GasTipCap()))
 				maxPriorityFeePerGas := hexutil.Big(*tx.GasTipCap())
-				batchCallConfig.Calls[1].MaxFeePerGas = &maxFeePerGas
-				batchCallConfig.Calls[1].MaxPriorityFeePerGas = &maxPriorityFeePerGas
+				batchCallConfig.BlockStateCalls[0].Calls[1].MaxFeePerGas = &maxFeePerGas
+				batchCallConfig.BlockStateCalls[0].Calls[1].MaxPriorityFeePerGas = &maxPriorityFeePerGas
 			}
 		}
 
-		results, err := this.bcApi.BatchCall(context.Background(), batchCallConfig)
+		blockNoOrHash := rpc.BlockNumberOrHashWithNumber(blockNumber)
+		results, err := this.bcApi.SimulateV1(context.Background(), batchCallConfig, &blockNoOrHash)
 		if err != nil {
 			return nil, err
 		}
-		if results[1].Error != nil {
-			return nil, results[1].Error
+		if results[1] == nil {
+			return nil, nil
 		}
-		return results[1].Return, nil
+
+		callResult := (results[0]["calls"].([]ethapi.SimCallResult))[1]
+
+		return callResult.ReturnValue, nil
 	}
 }
 
-func (this *Erc20) buildGetReservesBatchCallArgs(
-	pair *common.Address,
-	baseToken *common.Address,
-	token *common.Address,
-) (*ethapi.BatchCallArgs, *ethapi.BatchCallArgs, error) {
-	var (
-		baseTokenReserveBatchCallArgs ethapi.BatchCallArgs
-		tokenReserveBatchCallArgs     ethapi.BatchCallArgs
-	)
+// func (this *Erc20) buildGetReservesBatchCallArgs(
+// 	pair *common.Address,
+// 	baseToken *common.Address,
+// 	token *common.Address,
+// ) (*ethapi.BatchCallArgs, *ethapi.BatchCallArgs, error) {
+// 	var (
+// 		baseTokenReserveBatchCallArgs ethapi.BatchCallArgs
+// 		tokenReserveBatchCallArgs     ethapi.BatchCallArgs
+// 	)
 
-	txBalanceOfBaseTokenInput, err := this.BuildBalanceOfInput(pair)
-	if err != nil {
-		return nil, nil, err
-	}
-	baseTokenReserveBatchCallArgs = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			To:    baseToken,
-			Input: txBalanceOfBaseTokenInput,
-		},
-	}
+// 	txBalanceOfBaseTokenInput, err := this.BuildBalanceOfInput(pair)
+// 	if err != nil {
+// 		return nil, nil, err
+// 	}
+// 	baseTokenReserveBatchCallArgs = ethapi.BatchCallArgs{
+// 		TransactionArgs: ethapi.TransactionArgs{
+// 			To:    baseToken,
+// 			Input: txBalanceOfBaseTokenInput,
+// 		},
+// 	}
 
-	// 2. include balanceOf token tx in batch
-	txBalanceOfTokenInput, err := this.BuildBalanceOfInput(pair)
-	if err != nil {
-		return nil, nil, err
-	}
-	tokenReserveBatchCallArgs = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			To:    token,
-			Input: txBalanceOfTokenInput,
-		},
-	}
+// 	// 2. include balanceOf token tx in batch
+// 	txBalanceOfTokenInput, err := this.BuildBalanceOfInput(pair)
+// 	if err != nil {
+// 		return nil, nil, err
+// 	}
+// 	tokenReserveBatchCallArgs = ethapi.BatchCallArgs{
+// 		TransactionArgs: ethapi.TransactionArgs{
+// 			To:    token,
+// 			Input: txBalanceOfTokenInput,
+// 		},
+// 	}
 
-	return &baseTokenReserveBatchCallArgs, &tokenReserveBatchCallArgs, nil
-}
+// 	return &baseTokenReserveBatchCallArgs, &tokenReserveBatchCallArgs, nil
+// }
 
 func (this *Erc20) GetPairReserves(
 	pair *common.Address,
@@ -619,9 +625,20 @@ func (this *Erc20) GetPairReserves(
 	tokenReserve := big.NewInt(0)
 
 	// blockNr := this.getRpcBlockNumber(blockNumber)
-	var batchCallConfig = ethapi.BatchCallConfig{
-		Block: rpc.BlockNumberOrHashWithNumber(blockNumber),
-		Calls: make([]ethapi.BatchCallArgs, 2),
+	// var batchCallConfig = ethapi.BatchCallConfig{
+	// 	Block: rpc.BlockNumberOrHashWithNumber(blockNumber),
+	// 	Calls: make([]ethapi.BatchCallArgs, 2),
+	// }
+	var batchCallConfig = ethapi.SimOpts{
+		BlockStateCalls:        make([]ethapi.SimBlock, 1),
+		TraceTransfers:         false,
+		Validation:             false,
+		ReturnFullTransactions: true,
+	}
+	batchCallConfig.BlockStateCalls[0] = ethapi.SimBlock{
+		BlockOverrides: nil,
+		StateOverrides: nil,
+		Calls:          make([]ethapi.TransactionArgs, 2),
 	}
 
 	// 1. include balanceOf baseToken tx in batch
@@ -630,11 +647,9 @@ func (this *Erc20) GetPairReserves(
 		return baseReserve, tokenReserve, err
 	}
 
-	batchCallConfig.Calls[0] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			To:    baseToken,
-			Input: txBalanceOfBaseTokenInput,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[0] = ethapi.TransactionArgs{
+		To:    baseToken,
+		Input: txBalanceOfBaseTokenInput,
 	}
 
 	// 2. include balanceOf token tx in batch
@@ -643,24 +658,26 @@ func (this *Erc20) GetPairReserves(
 		return baseReserve, tokenReserve, err
 	}
 
-	batchCallConfig.Calls[1] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			To:    token,
-			Input: txBalanceOfTokenInput,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[1] = ethapi.TransactionArgs{
+		To:    token,
+		Input: txBalanceOfTokenInput,
 	}
 
-	outputs, err := this.bcApi.BatchCall(context.Background(), batchCallConfig)
+	blockNoOrHash := rpc.BlockNumberOrHashWithNumber(blockNumber)
+	outputs, err := this.bcApi.SimulateV1(context.Background(), batchCallConfig, &blockNoOrHash)
+
 	if err != nil {
 		return baseReserve, tokenReserve, err
 	}
 
-	baseReserve, err = this.ParseBalanceOfOutput(outputs[0].Return)
+	callResults := outputs[0]["calls"].([]ethapi.SimCallResult)
+
+	baseReserve, err = this.ParseBalanceOfOutput(callResults[0].ReturnValue)
 	if err != nil {
 		return baseReserve, tokenReserve, err
 	}
 
-	tokenReserve, err = this.ParseBalanceOfOutput(outputs[1].Return)
+	tokenReserve, err = this.ParseBalanceOfOutput(callResults[1].ReturnValue)
 	if err != nil {
 		return baseReserve, tokenReserve, err
 	}
@@ -668,31 +685,31 @@ func (this *Erc20) GetPairReserves(
 	return baseReserve, tokenReserve, nil
 }
 
-func (this *Erc20) BathCallTxs(
-	txs []*types.Transaction,
-	blockNumber rpc.BlockNumber,
-) ([]ethapi.CallResult, error) {
-	txCount := 0
-	if txs != nil {
-		txCount = len(txs)
-	}
+// func (this *Erc20) BathCallTxs(
+// 	txs []*types.Transaction,
+// 	blockNumber rpc.BlockNumber,
+// ) ([]ethapi.CallResult, error) {
+// 	txCount := 0
+// 	if txs != nil {
+// 		txCount = len(txs)
+// 	}
 
-	// blockNr := this.getRpcBlockNumber(blockNumber)
-	var batchCallConfig = ethapi.BatchCallConfig{
-		Block: rpc.BlockNumberOrHashWithNumber(blockNumber),
-		Calls: make([]ethapi.BatchCallArgs, txCount),
-	}
+// 	// blockNr := this.getRpcBlockNumber(blockNumber)
+// 	var batchCallConfig = ethapi.BatchCallConfig{
+// 		Block: rpc.BlockNumberOrHashWithNumber(blockNumber),
+// 		Calls: make([]ethapi.BatchCallArgs, txCount),
+// 	}
 
-	if txs != nil {
-		for idx, tx := range txs {
-			batchCallConfig.Calls[idx] = this.BuildBatchCallArgs(tx, true)
-		}
-	}
+// 	if txs != nil {
+// 		for idx, tx := range txs {
+// 			batchCallConfig.Calls[idx] = this.BuildBatchCallArgs(tx, true)
+// 		}
+// 	}
 
-	outputs, err := this.bcApi.BatchCall(context.Background(), batchCallConfig)
+// 	outputs, err := this.bcApi.BatchCall(context.Background(), batchCallConfig)
 
-	return outputs, err
-}
+// 	return outputs, err
+// }
 
 func (this *Erc20) GetPairReservesAfterTxs(
 	pair *common.Address,
@@ -711,15 +728,27 @@ func (this *Erc20) GetPairReservesAfterTxs(
 
 	// batch call config
 	// blockNr := this.getRpcBlockNumber(blockNumber)
-	var batchCallConfig = ethapi.BatchCallConfig{
-		Block: rpc.BlockNumberOrHashWithNumber(blockNumber),
-		Calls: make([]ethapi.BatchCallArgs, txCount+2),
+	// var batchCallConfig = ethapi.BatchCallConfig{
+	// 	Block: rpc.BlockNumberOrHashWithNumber(blockNumber),
+	// 	Calls: make([]ethapi.BatchCallArgs, txCount+2),
+	// }
+
+	var batchCallConfig = ethapi.SimOpts{
+		BlockStateCalls:        make([]ethapi.SimBlock, 1),
+		TraceTransfers:         false,
+		Validation:             false,
+		ReturnFullTransactions: true,
+	}
+	batchCallConfig.BlockStateCalls[0] = ethapi.SimBlock{
+		BlockOverrides: nil,
+		StateOverrides: nil,
+		Calls:          make([]ethapi.TransactionArgs, txCount+2),
 	}
 
 	// 1. include all txs in batch
 	if txs != nil {
 		for idx, tx := range txs {
-			batchCallConfig.Calls[idx] = this.BuildBatchCallArgs(tx, ignoreGasFee)
+			batchCallConfig.BlockStateCalls[0].Calls[idx] = this.BuildBatchCallArgs(tx, ignoreGasFee)
 		}
 	}
 
@@ -728,11 +757,9 @@ func (this *Erc20) GetPairReservesAfterTxs(
 	if err != nil {
 		return baseReserve, tokenReserve, err, nil
 	}
-	batchCallConfig.Calls[txCount] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			To:    baseToken,
-			Input: txBalanceOfBaseTokenInput,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[txCount] = ethapi.TransactionArgs{
+		To:    baseToken,
+		Input: txBalanceOfBaseTokenInput,
 	}
 
 	// 4. include balanceOf token tx in batch
@@ -740,34 +767,35 @@ func (this *Erc20) GetPairReservesAfterTxs(
 	if err != nil {
 		return baseReserve, tokenReserve, err, nil
 	}
-	batchCallConfig.Calls[txCount+1] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			To:    token,
-			Input: txBalanceOfTokenInput,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[txCount+1] = ethapi.TransactionArgs{
+		To:    token,
+		Input: txBalanceOfTokenInput,
 	}
 
 	// 4. batch call
-	outputs, err := this.bcApi.BatchCall(context.Background(), batchCallConfig)
+	blockNoOrHash := rpc.BlockNumberOrHashWithNumber(blockNumber)
+	outputs, err := this.bcApi.SimulateV1(context.Background(), batchCallConfig, &blockNoOrHash)
 	if err != nil {
 		return baseReserve, tokenReserve, err, nil
 	}
 
-	for idx, output := range outputs {
+	callResults := outputs[0]["calls"].([]ethapi.SimCallResult)
+
+	for idx, output := range callResults {
 		if idx < txCount {
 			if output.Error != nil {
 				txHash := txs[idx].Hash()
-				return baseReserve, tokenReserve, output.Error, &txHash
+				return baseReserve, tokenReserve, errors.New(output.Error.Message), &txHash
 			}
 		}
 	}
 
-	baseReserve, err = this.ParseBalanceOfOutput(outputs[txCount].Return)
+	baseReserve, err = this.ParseBalanceOfOutput(callResults[txCount].ReturnValue)
 	if err != nil {
 		return baseReserve, tokenReserve, err, nil
 	}
 
-	tokenReserve, err = this.ParseBalanceOfOutput(outputs[txCount+1].Return)
+	tokenReserve, err = this.ParseBalanceOfOutput(callResults[txCount+1].ReturnValue)
 	if err != nil {
 		return baseReserve, tokenReserve, err, nil
 	}

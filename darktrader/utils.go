@@ -499,34 +499,43 @@ func CheckTokenTxs(currentHead *types.Header, pair *DTPair, tx *types.Transactio
 		}
 	}
 
-	var batchCallConfig = ethapi.BatchCallConfig{
-		Block:          rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber),
+	// var batchCallConfig = ethapi.BatchCallConfig{
+	// 	Block:          rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber),
+	// 	StateOverrides: &stateOverrides,
+	// }
+
+	var batchCallConfig = ethapi.SimOpts{
+		TraceTransfers:         false,
+		Validation:             false,
+		ReturnFullTransactions: true,
+	}
+
+	batchCallConfig.BlockStateCalls[0] = ethapi.SimBlock{
+		BlockOverrides: nil,
 		StateOverrides: &stateOverrides,
 	}
 	callIndex := 0
 	if pair.triggerTx != nil {
 		// trigger tx, my buy txs, other buy txs, balance of weth, balance of token
-		batchCallConfig.Calls = make([]ethapi.BatchCallArgs, 1+len(txs)+2)
+		batchCallConfig.BlockStateCalls[0].Calls = make([]ethapi.TransactionArgs, 1+len(txs)+2)
 
 		txFrom, _ := GetFrom(pair.triggerTx)
 		txValue := hexutil.Big(*pair.triggerTx.Value())
 		txInput := hexutil.Bytes(pair.triggerTx.Data())
 		gas := hexutil.Uint64(pair.triggerTx.Gas())
 		nonce := hexutil.Uint64(pair.triggerTx.Nonce())
-		batchCallConfig.Calls[0] = ethapi.BatchCallArgs{
-			TransactionArgs: ethapi.TransactionArgs{
-				From:    &txFrom,
-				To:      pair.triggerTx.To(),
-				Value:   &txValue,
-				Input:   &txInput,
-				ChainID: &scamchecker.chainId,
-				Gas:     &gas,
-				Nonce:   &nonce,
-			},
+		batchCallConfig.BlockStateCalls[0].Calls[0] = ethapi.TransactionArgs{
+			From:    &txFrom,
+			To:      pair.triggerTx.To(),
+			Value:   &txValue,
+			Input:   &txInput,
+			ChainID: &scamchecker.chainId,
+			Gas:     &gas,
+			Nonce:   &nonce,
 		}
 		callIndex++
 	} else {
-		batchCallConfig.Calls = make([]ethapi.BatchCallArgs, len(txs)+2)
+		batchCallConfig.BlockStateCalls[0].Calls = make([]ethapi.TransactionArgs, len(txs)+2)
 	}
 
 	// slippagePercent := config.maxBuySlippageInPercent
@@ -572,16 +581,14 @@ func CheckTokenTxs(currentHead *types.Header, pair *DTPair, tx *types.Transactio
 		txInput := hexutil.Bytes(txs[i].tx.Data())
 		gas := hexutil.Uint64(txs[i].tx.Gas())
 		Nonce := hexutil.Uint64(txs[i].tx.Nonce())
-		batchCallConfig.Calls[callIndexTxs+i] = ethapi.BatchCallArgs{
-			TransactionArgs: ethapi.TransactionArgs{
-				From:    &txFrom,
-				To:      txs[i].tx.To(),
-				Value:   &txValue,
-				Input:   &txInput,
-				ChainID: &scamchecker.chainId,
-				Gas:     &gas,
-				Nonce:   &Nonce,
-			},
+		batchCallConfig.BlockStateCalls[0].Calls[callIndexTxs+i] = ethapi.TransactionArgs{
+			From:    &txFrom,
+			To:      txs[i].tx.To(),
+			Value:   &txValue,
+			Input:   &txInput,
+			ChainID: &scamchecker.chainId,
+			Gas:     &gas,
+			Nonce:   &Nonce,
 		}
 		callIndex++
 	}
@@ -591,11 +598,9 @@ func CheckTokenTxs(currentHead *types.Header, pair *DTPair, tx *types.Transactio
 		fmt.Println("Error in pack buy input", err)
 		return nil
 	}
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			To:    pair.baseToken,
-			Input: txBalanceOfBaseTokenInput,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		To:    pair.baseToken,
+		Input: txBalanceOfBaseTokenInput,
 	}
 	callIndex++
 	callIndexToken := callIndex
@@ -604,15 +609,15 @@ func CheckTokenTxs(currentHead *types.Header, pair *DTPair, tx *types.Transactio
 		fmt.Println("Error in pack buy input", err)
 		return nil
 	}
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			To:    pair.token,
-			Input: txBalanceOfTokenInput,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		To:    pair.token,
+		Input: txBalanceOfTokenInput,
 	}
 	callIndex++
 
-	results, err := bcApi.BatchCall(context.Background(), batchCallConfig)
+	outputs, err := bcApi.SimulateV1(context.Background(), batchCallConfig, nil)
+
+	results := outputs[0]["calls"].([]ethapi.SimCallResult)
 
 	if err != nil {
 		fmt.Println("[CheckTokenTxs]-BatchCall", err)
@@ -625,12 +630,12 @@ func CheckTokenTxs(currentHead *types.Header, pair *DTPair, tx *types.Transactio
 		return nil
 	}
 
-	baseReserve, err := erc20.ParseBalanceOfOutput(results[callIndexWeth].Return)
+	baseReserve, err := erc20.ParseBalanceOfOutput(results[callIndexWeth].ReturnValue)
 	if err != nil {
 		fmt.Println("[CheckTokenTxs]-ParserBaseReserve", err)
 		return nil
 	}
-	tokenReserve, err := erc20.ParseBalanceOfOutput(results[callIndexToken].Return)
+	tokenReserve, err := erc20.ParseBalanceOfOutput(results[callIndexToken].ReturnValue)
 	if err != nil {
 		fmt.Println("[CheckTokenTxs]-ParserTokenReserve", err)
 		return nil

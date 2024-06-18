@@ -43,14 +43,14 @@ const (
 	maxSimulateBlocks = 256
 )
 
-// simBlock is a batch of calls to be simulated sequentially.
-type simBlock struct {
+// SimBlock is a batch of calls to be simulated sequentially.
+type SimBlock struct {
 	BlockOverrides *BlockOverrides
 	StateOverrides *StateOverride
 	Calls          []TransactionArgs
 }
 
-type simCallResult struct {
+type SimCallResult struct {
 	ReturnValue hexutil.Bytes  `json:"returnData"`
 	Logs        []*types.Log   `json:"logs"`
 	GasUsed     hexutil.Uint64 `json:"gasUsed"`
@@ -58,8 +58,8 @@ type simCallResult struct {
 	Error       *callError     `json:"error,omitempty"`
 }
 
-func (r *simCallResult) MarshalJSON() ([]byte, error) {
-	type callResultAlias simCallResult
+func (r *SimCallResult) MarshalJSON() ([]byte, error) {
+	type callResultAlias SimCallResult
 	// Marshal logs to be an empty array instead of nil when empty
 	if r.Logs == nil {
 		r.Logs = []*types.Log{}
@@ -67,8 +67,8 @@ func (r *simCallResult) MarshalJSON() ([]byte, error) {
 	return json.Marshal((*callResultAlias)(r))
 }
 
-type simOpts struct {
-	BlockStateCalls        []simBlock
+type SimOpts struct {
+	BlockStateCalls        []SimBlock
 	TraceTransfers         bool
 	Validation             bool
 	ReturnFullTransactions bool
@@ -84,7 +84,7 @@ type simulator struct {
 	fullTx         bool
 }
 
-func (sim *simulator) execute(ctx context.Context, blocks []simBlock) ([]map[string]interface{}, error) {
+func (sim *simulator) execute(ctx context.Context, blocks []SimBlock) ([]map[string]interface{}, error) {
 	// Setup context so it may be cancelled before the calls completed
 	// or, in case of unmetered gas, setup a context with a timeout.
 	var (
@@ -130,7 +130,7 @@ func (sim *simulator) execute(ctx context.Context, blocks []simBlock) ([]map[str
 	return results, nil
 }
 
-func (sim *simulator) processBlock(ctx context.Context, block *simBlock, header, parent *types.Header, headers []*types.Header, gp *core.GasPool, precompiles vm.PrecompiledContracts, timeout time.Duration) (map[string]interface{}, error) {
+func (sim *simulator) processBlock(ctx context.Context, block *SimBlock, header, parent *types.Header, headers []*types.Header, gp *core.GasPool, precompiles vm.PrecompiledContracts, timeout time.Duration) (map[string]interface{}, error) {
 	// Set header fields that depend only on parent block.
 	config := sim.b.ChainConfig()
 	// Parent hash is needed for evm.GetHashFn to work.
@@ -167,7 +167,7 @@ func (sim *simulator) processBlock(ctx context.Context, block *simBlock, header,
 	var (
 		gasUsed, blobGasUsed uint64
 		txes                 = make([]*types.Transaction, len(block.Calls))
-		callResults          = make([]simCallResult, len(block.Calls))
+		callResults          = make([]SimCallResult, len(block.Calls))
 		receipts             = make([]*types.Receipt, len(block.Calls))
 		tracer               = newTracer(sim.traceTransfers, blockContext.BlockNumber.Uint64(), common.Hash{}, common.Hash{}, 0)
 		vmConfig             = &vm.Config{
@@ -214,7 +214,7 @@ func (sim *simulator) processBlock(ctx context.Context, block *simBlock, header,
 		receipts[i] = core.MakeReceipt(evm, result, sim.state, blockContext.BlockNumber, common.Hash{}, tx, gasUsed, root)
 		blobGasUsed += receipts[i].BlobGasUsed
 		logs := tracer.Logs()
-		callRes := simCallResult{ReturnValue: result.Return(), Logs: logs, GasUsed: hexutil.Uint64(result.UsedGas)}
+		callRes := SimCallResult{ReturnValue: result.Return(), Logs: logs, GasUsed: hexutil.Uint64(result.UsedGas)}
 		if result.Failed() {
 			callRes.Status = hexutil.Uint64(types.ReceiptStatusFailed)
 			if errors.Is(result.Err, vm.ErrExecutionReverted) {
@@ -250,7 +250,7 @@ func (sim *simulator) processBlock(ctx context.Context, block *simBlock, header,
 // repairLogs updates the block hash in the logs present in the result of
 // a simulated block. This is needed as during execution when logs are collected
 // the block hash is not known.
-func repairLogs(calls []simCallResult, hash common.Hash) {
+func repairLogs(calls []SimCallResult, hash common.Hash) {
 	for i := range calls {
 		for j := range calls[i].Logs {
 			calls[i].Logs[j].BlockHash = hash
@@ -289,9 +289,9 @@ func (sim *simulator) activePrecompiles(ctx context.Context, base *types.Header)
 // sanitizeBlockOrder iterates the blocks checking that block numbers
 // are strictly increasing. When necessary it will generate empty blocks.
 // It modifies the block's override object.
-func (sim *simulator) sanitizeBlockOrder(blocks []simBlock) ([]simBlock, error) {
+func (sim *simulator) sanitizeBlockOrder(blocks []SimBlock) ([]SimBlock, error) {
 	var (
-		res        = make([]simBlock, 0, len(blocks))
+		res        = make([]SimBlock, 0, len(blocks))
 		base       = sim.base
 		prevNumber = base.Number
 	)
@@ -316,7 +316,7 @@ func (sim *simulator) sanitizeBlockOrder(blocks []simBlock) ([]simBlock, error) 
 			// Assign block number to the empty blocks.
 			for i := uint64(0); i < gap.Uint64(); i++ {
 				n := new(big.Int).Add(prevNumber, big.NewInt(int64(i+1)))
-				b := simBlock{BlockOverrides: &BlockOverrides{Number: (*hexutil.Big)(n)}}
+				b := SimBlock{BlockOverrides: &BlockOverrides{Number: (*hexutil.Big)(n)}}
 				res = append(res, b)
 			}
 		}
@@ -330,7 +330,7 @@ func (sim *simulator) sanitizeBlockOrder(blocks []simBlock) ([]simBlock, error) 
 // makeHeaders makes header object with preliminary fields based on a simulated block.
 // Some fields have to be filled post-execution.
 // It assumes blocks are in order and numbers have been validated.
-func (sim *simulator) makeHeaders(blocks []simBlock) ([]*types.Header, error) {
+func (sim *simulator) makeHeaders(blocks []SimBlock) ([]*types.Header, error) {
 	var (
 		res           = make([]*types.Header, len(blocks))
 		config        = sim.b.ChainConfig()

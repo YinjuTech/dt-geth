@@ -124,8 +124,19 @@ func (this *ScamChecker) CalcBuyAmount(pair *DTPair, config *DTConfig, blockNumb
 		Balance: &balanceTest1,
 	}
 
-	var batchCallConfig = ethapi.BatchCallConfig{
-		Block:          rpc.BlockNumberOrHashWithNumber(blockNumber),
+	// var batchCallConfig = ethapi.BatchCallConfig{
+	// 	Block:          rpc.BlockNumberOrHashWithNumber(blockNumber),
+	// 	StateOverrides: &stateOverrides,
+	// }
+
+	var batchCallConfig = ethapi.SimOpts{
+		BlockStateCalls:        make([]ethapi.SimBlock, 1),
+		TraceTransfers:         false,
+		Validation:             false,
+		ReturnFullTransactions: true,
+	}
+	batchCallConfig.BlockStateCalls[0] = ethapi.SimBlock{
+		BlockOverrides: nil,
 		StateOverrides: &stateOverrides,
 	}
 
@@ -144,78 +155,73 @@ func (this *ScamChecker) CalcBuyAmount(pair *DTPair, config *DTConfig, blockNumb
 	// Pending Tx
 	if pendingTx != nil {
 		// triggerTxFrom, err := GetFrom(pendingTx)
-		batchCallConfig.Calls = make([]ethapi.BatchCallArgs, 4)
+		batchCallConfig.BlockStateCalls[0].Calls = make([]ethapi.TransactionArgs, 4)
 
 		txFrom, _ := GetFrom(pendingTx)
 		txValue := hexutil.Big(*pendingTx.Value())
 		txInput := hexutil.Bytes(pendingTx.Data())
 		gas := hexutil.Uint64(pendingTx.Gas())
-		batchCallConfig.Calls[0] = ethapi.BatchCallArgs{
-			TransactionArgs: ethapi.TransactionArgs{
-				From:    &txFrom,
-				To:      pendingTx.To(),
-				Value:   &txValue,
-				Input:   &txInput,
-				ChainID: &this.chainId,
-				Gas:     &gas,
-			},
+		batchCallConfig.BlockStateCalls[0].Calls[0] = ethapi.TransactionArgs{
+			From:    &txFrom,
+			To:      pendingTx.To(),
+			Value:   &txValue,
+			Input:   &txInput,
+			ChainID: &this.chainId,
+			Gas:     &gas,
 		}
 		callIndex++
 	} else {
-		batchCallConfig.Calls = make([]ethapi.BatchCallArgs, 3)
+		batchCallConfig.BlockStateCalls[0].Calls = make([]ethapi.TransactionArgs, 3)
 	}
 
 	path, _ := BuildSwapPath(pair)
 
 	// get amounts out
 	amountsOutInput, _ := this.uniswapv2.BuildGetAmountsOutInput(amount, path)
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			From:    &config.testAccountAddress,
-			To:      &v2RouterAddrObj,
-			Input:   amountsOutInput,
-			ChainID: &this.chainId,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		From:    &config.testAccountAddress,
+		To:      &v2RouterAddrObj,
+		Input:   amountsOutInput,
+		ChainID: &this.chainId,
 	}
 	callIndex++
 
 	// swap
 	swapInput, _ := this.uniswapv2.BuildSwapExactEthForTokenInput(big.NewInt(0), path, config.testAccountAddress, big.NewInt(time.Now().Unix()+200))
 	swapTxValue := hexutil.Big(*amount)
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			From:    &config.testAccountAddress,
-			To:      &v2RouterAddrObj,
-			Value:   &swapTxValue,
-			Input:   swapInput,
-			ChainID: &this.chainId,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		From:    &config.testAccountAddress,
+		To:      &v2RouterAddrObj,
+		Value:   &swapTxValue,
+		Input:   swapInput,
+		ChainID: &this.chainId,
 	}
 	swapCallIdx = callIndex
 	callIndex++
 
 	// balance of
 	balanceOfInput, _ := this.erc20.BuildBalanceOfInput(&config.testAccountAddress)
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			From:    &config.testAccountAddress,
-			To:      pair.token,
-			Input:   balanceOfInput,
-			ChainID: &this.chainId,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		From:    &config.testAccountAddress,
+		To:      pair.token,
+		Input:   balanceOfInput,
+		ChainID: &this.chainId,
 	}
 
 	tryIdx := 1
+	blockNoOrHash := rpc.BlockNumberOrHashWithNumber(blockNumber)
 	for {
-		results, err := this.bcApi.BatchCall(context.Background(), batchCallConfig)
+		outputs, err := this.bcApi.SimulateV1(context.Background(), batchCallConfig, &blockNoOrHash)
 
 		if err != nil {
 			return big.NewInt(0), uint(0), big.NewInt(0), big.NewInt(0), err
 		}
 
+		results := outputs[0]["calls"].([]ethapi.SimCallResult)
+
 		if results[swapCallIdx].Error == nil {
-			amountExpecteds, _ := this.uniswapv2.ParseGetAmountsOutOutput(results[swapCallIdx-1].Return)
-			amountBought, _ := this.erc20.ParseBalanceOfOutput(results[swapCallIdx+1].Return)
+			amountExpecteds, _ := this.uniswapv2.ParseGetAmountsOutOutput(results[swapCallIdx-1].ReturnValue)
+			amountBought, _ := this.erc20.ParseBalanceOfOutput(results[swapCallIdx+1].ReturnValue)
 			return amount, uint(len(config.wallets)), amountExpecteds[len(amountExpecteds)-1], amountBought, nil
 		} else {
 			// fmt.Println("Try buy amount", amount, "error", results[swapCallIdx].Error)
@@ -228,24 +234,20 @@ func (this *ScamChecker) CalcBuyAmount(pair *DTPair, config *DTConfig, blockNumb
 		amount = tryBuyAmount[tryIdx]
 
 		amountsOutInput, _ := this.uniswapv2.BuildGetAmountsOutInput(amount, path)
-		batchCallConfig.Calls[swapCallIdx-1] = ethapi.BatchCallArgs{
-			TransactionArgs: ethapi.TransactionArgs{
-				From:    &config.testAccountAddress,
-				To:      &v2RouterAddrObj,
-				Input:   amountsOutInput,
-				ChainID: &this.chainId,
-			},
+		batchCallConfig.BlockStateCalls[0].Calls[swapCallIdx-1] = ethapi.TransactionArgs{
+			From:    &config.testAccountAddress,
+			To:      &v2RouterAddrObj,
+			Input:   amountsOutInput,
+			ChainID: &this.chainId,
 		}
 
 		swapTxValue := hexutil.Big(*amount)
-		batchCallConfig.Calls[swapCallIdx] = ethapi.BatchCallArgs{
-			TransactionArgs: ethapi.TransactionArgs{
-				From:    &config.testAccountAddress,
-				To:      &v2RouterAddrObj,
-				Value:   &swapTxValue,
-				Input:   swapInput,
-				ChainID: &this.chainId,
-			},
+		batchCallConfig.BlockStateCalls[0].Calls[swapCallIdx] = ethapi.TransactionArgs{
+			From:    &config.testAccountAddress,
+			To:      &v2RouterAddrObj,
+			Value:   &swapTxValue,
+			Input:   swapInput,
+			ChainID: &this.chainId,
 		}
 
 		tryIdx = tryIdx + 1
@@ -261,8 +263,18 @@ func (this *ScamChecker) CalcSellAmount(pair *DTPair, from *common.Address, amou
 		 - call sell - uniswap v2
 		 - call balance of weth
 	*/
-	var batchCallConfig = ethapi.BatchCallConfig{
-		Block: rpc.BlockNumberOrHashWithNumber(blockNumber),
+	// var batchCallConfig = ethapi.BatchCallConfig{
+	// 	Block: rpc.BlockNumberOrHashWithNumber(blockNumber),
+	// }
+	var batchCallConfig = ethapi.SimOpts{
+		BlockStateCalls:        make([]ethapi.SimBlock, 1),
+		TraceTransfers:         false,
+		Validation:             false,
+		ReturnFullTransactions: true,
+	}
+	batchCallConfig.BlockStateCalls[0] = ethapi.SimBlock{
+		BlockOverrides: nil,
+		StateOverrides: nil,
 	}
 
 	callIndex := 0
@@ -270,23 +282,21 @@ func (this *ScamChecker) CalcSellAmount(pair *DTPair, from *common.Address, amou
 
 	// Pending Tx
 	if pendingTx != nil {
-		batchCallConfig.Calls = make([]ethapi.BatchCallArgs, 5)
+		batchCallConfig.BlockStateCalls[0].Calls = make([]ethapi.TransactionArgs, 5)
 
 		txFrom, _ := GetFrom(pendingTx)
 		txValue := hexutil.Big(*pendingTx.Value())
 		txInput := hexutil.Bytes(pendingTx.Data())
-		batchCallConfig.Calls[0] = ethapi.BatchCallArgs{
-			TransactionArgs: ethapi.TransactionArgs{
-				From:    &txFrom,
-				To:      pendingTx.To(),
-				Value:   &txValue,
-				Input:   &txInput,
-				ChainID: &this.chainId,
-			},
+		batchCallConfig.BlockStateCalls[0].Calls[0] = ethapi.TransactionArgs{
+			From:    &txFrom,
+			To:      pendingTx.To(),
+			Value:   &txValue,
+			Input:   &txInput,
+			ChainID: &this.chainId,
 		}
 		callIndex++
 	} else {
-		batchCallConfig.Calls = make([]ethapi.BatchCallArgs, 4)
+		batchCallConfig.BlockStateCalls[0].Calls = make([]ethapi.TransactionArgs, 4)
 	}
 
 	_, sellPath := BuildSwapPath(pair)
@@ -302,70 +312,65 @@ func (this *ScamChecker) CalcSellAmount(pair *DTPair, from *common.Address, amou
 	// get amount out
 	getAmountOutInput, _ := this.uniswapv2.BuildGetAmountsOutInput(amountToken, sellPath)
 	amountOutCallIndex := callIndex
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			From:    from,
-			To:      &v2RouterAddrObj,
-			Input:   getAmountOutInput,
-			ChainID: &this.chainId,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		From:    from,
+		To:      &v2RouterAddrObj,
+		Input:   getAmountOutInput,
+		ChainID: &this.chainId,
 	}
 	callIndex++
 
 	//approve
 	approveInput, _ := this.erc20.BuildApproveInput(&v2RouterAddrObj, amountToken)
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			From:    from,
-			To:      pair.token,
-			Input:   approveInput,
-			ChainID: &this.chainId,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		From:    from,
+		To:      pair.token,
+		Input:   approveInput,
+		ChainID: &this.chainId,
 	}
 	callIndex++
 
 	//sell
 
 	swapSellInput, _ := this.uniswapv2.BuildSwapExactTokensForTokensSupportingFeeOnTransferTokensInput(amountToken, big.NewInt(0), sellPath, *from, big.NewInt(time.Now().Unix()+200))
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			From:    from,
-			To:      &v2RouterAddrObj,
-			Input:   swapSellInput,
-			ChainID: &this.chainId,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		From:    from,
+		To:      &v2RouterAddrObj,
+		Input:   swapSellInput,
+		ChainID: &this.chainId,
 	}
 	if nextBlockOverrides != nil {
-		batchCallConfig.Calls[callIndex].BlockOverrides = nextBlockOverrides
+		batchCallConfig.BlockStateCalls[0].BlockOverrides = nextBlockOverrides
 	}
 	callSellIndex = callIndex
 	callIndex++
 
 	balanceOfInput, _ := this.erc20.BuildBalanceOfInput(from)
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			From:    from,
-			To:      pair.baseToken,
-			Input:   balanceOfInput,
-			ChainID: &this.chainId,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		From:    from,
+		To:      pair.baseToken,
+		Input:   balanceOfInput,
+		ChainID: &this.chainId,
 	}
-	if nextBlockOverrides != nil {
-		batchCallConfig.Calls[callIndex].BlockOverrides = nextBlockOverrides
-	}
-	results, err := this.bcApi.BatchCall(context.Background(), batchCallConfig)
+	// if nextBlockOverrides != nil {
+	// 	batchCallConfig.BlockStateCalls[0].Calls[callIndex].BlockOverrides = nextBlockOverrides
+	// }
+	blockNoOrHash := rpc.BlockNumberOrHashWithNumber(blockNumber)
+	outputs, err := this.bcApi.SimulateV1(context.Background(), batchCallConfig, &blockNoOrHash)
 
 	if err != nil {
 		return big.NewInt(0), big.NewInt(0), err
 	}
 
+	results := outputs[0]["calls"].([]ethapi.SimCallResult)
+
 	if results[callSellIndex].Error == nil {
-		amountExpecteds, _ := this.uniswapv2.ParseSwapExactTokensForTokensOutput(results[amountOutCallIndex].Return)
-		amountSold, _ := this.erc20.ParseBalanceOfOutput(results[callSellIndex+1].Return)
+		amountExpecteds, _ := this.uniswapv2.ParseSwapExactTokensForTokensOutput(results[amountOutCallIndex].ReturnValue)
+		amountSold, _ := this.erc20.ParseBalanceOfOutput(results[callSellIndex+1].ReturnValue)
 		return amountExpecteds[len(amountExpecteds)-1], amountSold, nil
 	}
 
-	return big.NewInt(0), big.NewInt(0), results[callSellIndex].Error
+	return big.NewInt(0), big.NewInt(0), errors.New(results[callSellIndex].Error.Message)
 }
 
 func (this *ScamChecker) CheckBuySell(pair *DTPair, amount *big.Int, amountToken *big.Int, blockNumber int64, timestamp uint64, buySellCheckCount uint8, pendingTx *types.Transaction) (*big.Int, *big.Int, error) {
@@ -385,8 +390,19 @@ func (this *ScamChecker) CheckBuySell(pair *DTPair, amount *big.Int, amountToken
 			Balance: &balanceTest1,
 		}
 	}
-	var batchCallConfig = ethapi.BatchCallConfig{
-		Block:          rpc.BlockNumberOrHashWithNumber(rpc.BlockNumber(blockNumber)),
+	// var batchCallConfig = ethapi.BatchCallConfig{
+	// 	Block:          rpc.BlockNumberOrHashWithNumber(rpc.BlockNumber(blockNumber)),
+	// 	StateOverrides: &stateOverrides,
+	// }
+
+	var batchCallConfig = ethapi.SimOpts{
+		BlockStateCalls:        make([]ethapi.SimBlock, 1),
+		TraceTransfers:         false,
+		Validation:             false,
+		ReturnFullTransactions: true,
+	}
+	batchCallConfig.BlockStateCalls[0] = ethapi.SimBlock{
+		BlockOverrides: nil,
 		StateOverrides: &stateOverrides,
 	}
 
@@ -397,23 +413,21 @@ func (this *ScamChecker) CheckBuySell(pair *DTPair, amount *big.Int, amountToken
 	// Pending Tx
 	if pendingTx != nil {
 		totalCallCount++
-		batchCallConfig.Calls = make([]ethapi.BatchCallArgs, totalCallCount)
+		batchCallConfig.BlockStateCalls[0].Calls = make([]ethapi.TransactionArgs, totalCallCount)
 
 		txFrom, _ := GetFrom(pendingTx)
 		txValue := hexutil.Big(*pendingTx.Value())
 		txInput := hexutil.Bytes(pendingTx.Data())
-		batchCallConfig.Calls[0] = ethapi.BatchCallArgs{
-			TransactionArgs: ethapi.TransactionArgs{
-				From:    &txFrom,
-				To:      pendingTx.To(),
-				Value:   &txValue,
-				Input:   &txInput,
-				ChainID: &this.chainId,
-			},
+		batchCallConfig.BlockStateCalls[0].Calls[0] = ethapi.TransactionArgs{
+			From:    &txFrom,
+			To:      pendingTx.To(),
+			Value:   &txValue,
+			Input:   &txInput,
+			ChainID: &this.chainId,
 		}
 		callIndex++
 	} else {
-		batchCallConfig.Calls = make([]ethapi.BatchCallArgs, totalCallCount)
+		batchCallConfig.BlockStateCalls[0].Calls = make([]ethapi.TransactionArgs, totalCallCount)
 	}
 
 	buyPath, sellPath := BuildSwapPath(pair)
@@ -421,107 +435,97 @@ func (this *ScamChecker) CheckBuySell(pair *DTPair, amount *big.Int, amountToken
 	for i := int64(0); i < int64(buySellCheckCount); i++ {
 		swapInput, _ := this.uniswapv2.BuildSwapExactEthForTokenInput(big.NewInt(0), buyPath, this.testWallets[i].address, big.NewInt(time.Now().Unix()+200))
 		swapTxValue := hexutil.Big(*amount)
-		blkNumber1 := big.NewInt(blockNumber + i)
-		blkNumber := hexutil.Big(*blkNumber1)
-		blkTime := hexutil.Uint64(timestamp + uint64(i*12))
-		batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-			TransactionArgs: ethapi.TransactionArgs{
-				From:    &this.testWallets[i].address,
-				To:      &v2RouterAddrObj,
-				Value:   &swapTxValue,
-				Input:   swapInput,
-				ChainID: &this.chainId,
-			},
-			BlockOverrides: &ethapi.BlockOverrides{
-				Number: &blkNumber,
-				Time:   &blkTime,
-			},
+		// blkNumber1 := big.NewInt(blockNumber + i)
+		// blkNumber := hexutil.Big(*blkNumber1)
+		// blkTime := hexutil.Uint64(timestamp + uint64(i*12))
+		batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+			From:    &this.testWallets[i].address,
+			To:      &v2RouterAddrObj,
+			Value:   &swapTxValue,
+			Input:   swapInput,
+			ChainID: &this.chainId,
 		}
 		callIndex++
 	}
 
 	//approve
-	blkNumber1 := big.NewInt(blockNumber + int64(buySellCheckCount))
-	blkNumber := hexutil.Big(*blkNumber1)
-	blkTime := hexutil.Uint64(timestamp + uint64(buySellCheckCount*12))
+	// blkNumber1 := big.NewInt(blockNumber + int64(buySellCheckCount))
+	// blkNumber := hexutil.Big(*blkNumber1)
+	// blkTime := hexutil.Uint64(timestamp + uint64(buySellCheckCount*12))
 
 	approveInput, _ := this.erc20.BuildApproveInput(&v2RouterAddrObj, UINT256_MAX)
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			From:    &this.testWallets[0].address,
-			To:      pair.token,
-			Input:   approveInput,
-			ChainID: &this.chainId,
-		},
-		BlockOverrides: &ethapi.BlockOverrides{
-			Number: &blkNumber,
-			Time:   &blkTime,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		From:    &this.testWallets[0].address,
+		To:      pair.token,
+		Input:   approveInput,
+		ChainID: &this.chainId,
 	}
+	// 	BlockOverrides: &ethapi.BlockOverrides{
+	// 		Number: &blkNumber,
+	// 		Time:   &blkTime,
+	// 	},
+	// }
 	callIndex++
 
 	// get amount out
 	getAmountOutInput, _ := this.uniswapv2.BuildGetAmountsOutInput(amountToken, sellPath)
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			From:    &this.testWallets[0].address,
-			To:      &v2RouterAddrObj,
-			Input:   getAmountOutInput,
-			ChainID: &this.chainId,
-		},
-		BlockOverrides: &ethapi.BlockOverrides{
-			Number: &blkNumber,
-			Time:   &blkTime,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		From:    &this.testWallets[0].address,
+		To:      &v2RouterAddrObj,
+		Input:   getAmountOutInput,
+		ChainID: &this.chainId,
 	}
+	// BlockOverrides: &ethapi.BlockOverrides{
+	// 	Number: &blkNumber,
+	// 	Time:   &blkTime,
+	// },
 	callIndex++
 
 	//sell
 	swapSellInput, _ := this.uniswapv2.BuildSwapExactTokensForTokensSupportingFeeOnTransferTokensInput(amountToken, big.NewInt(0), sellPath, this.testWallets[0].address, big.NewInt(time.Now().Unix()+200))
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			From:    &this.testWallets[0].address,
-			To:      &v2RouterAddrObj,
-			Input:   swapSellInput,
-			ChainID: &this.chainId,
-		},
-		BlockOverrides: &ethapi.BlockOverrides{
-			Number: &blkNumber,
-			Time:   &blkTime,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		From:    &this.testWallets[0].address,
+		To:      &v2RouterAddrObj,
+		Input:   swapSellInput,
+		ChainID: &this.chainId,
 	}
+	// BlockOverrides: &ethapi.BlockOverrides{
+	// 	Number: &blkNumber,
+	// 	Time:   &blkTime,
+	// },
 	callSellIndex = callIndex
 	callIndex++
 
 	// balance of
 	balanceOfInput, _ := this.erc20.BuildBalanceOfInput(&this.testWallets[0].address)
-	batchCallConfig.Calls[callIndex] = ethapi.BatchCallArgs{
-		TransactionArgs: ethapi.TransactionArgs{
-			From:    &this.testWallets[0].address,
-			To:      pair.baseToken,
-			Input:   balanceOfInput,
-			ChainID: &this.chainId,
-		},
-		BlockOverrides: &ethapi.BlockOverrides{
-			Number: &blkNumber,
-			Time:   &blkTime,
-		},
+	batchCallConfig.BlockStateCalls[0].Calls[callIndex] = ethapi.TransactionArgs{
+		From:    &this.testWallets[0].address,
+		To:      pair.baseToken,
+		Input:   balanceOfInput,
+		ChainID: &this.chainId,
 	}
+	// BlockOverrides: &ethapi.BlockOverrides{
+	// 	Number: &blkNumber,
+	// 	Time:   &blkTime,
+	// },
 
-	results, err := this.bcApi.BatchCall(context.Background(), batchCallConfig)
+	blockNoOrHash := rpc.BlockNumberOrHashWithNumber(rpc.BlockNumber(blockNumber))
+	outputs, err := this.bcApi.SimulateV1(context.Background(), batchCallConfig, &blockNoOrHash)
 
 	if err != nil {
 		return big.NewInt(0), big.NewInt(0), err
 	}
 
+	results := outputs[0]["calls"].([]ethapi.SimCallResult)
+
 	if results[callSellIndex].Error == nil {
-		// amountExpecteds, _ := this.uniswapv2.ParseSwapExactTokensForTokensOutput(results[callSellIndex].Return)
-		amountExpecteds, _ := this.uniswapv2.ParseGetAmountsOutOutput(results[callSellIndex-1].Return)
-		amountSold, _ := this.erc20.ParseBalanceOfOutput(results[callSellIndex+1].Return)
+		// amountExpecteds, _ := this.uniswapv2.ParseSwapExactTokensForTokensOutput(results[callSellIndex].ReturnValue)
+		amountExpecteds, _ := this.uniswapv2.ParseGetAmountsOutOutput(results[callSellIndex-1].ReturnValue)
+		amountSold, _ := this.erc20.ParseBalanceOfOutput(results[callSellIndex+1].ReturnValue)
 		return amountExpecteds[len(amountExpecteds)-1], amountSold, nil
 	}
 
-	return big.NewInt(0), big.NewInt(0), results[callSellIndex].Error
+	return big.NewInt(0), big.NewInt(0), errors.New(results[callSellIndex].Error.Message)
 }
 
 // func (this *ScamChecker) CanBuy(pair *DTPair, from *common.Address, blockNumber rpc.BlockNumber, pendingTx *types.Transaction) (*big.Int, *big.Int, error) {
