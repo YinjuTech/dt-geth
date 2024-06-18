@@ -1,0 +1,1600 @@
+package darktrader
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"errors"
+	"fmt"
+	"math/big"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm/runtime"
+	"github.com/ethereum/go-ethereum/eth/tracers"
+	"github.com/ethereum/go-ethereum/eth/tracers/logger"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/internal/ethapi"
+	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/status-im/keycard-go/hexutils"
+)
+
+type blockChain interface {
+	CurrentBlock() *types.Header
+
+	GetBlockByNumber(number uint64) *types.Block
+
+	StateAt(root common.Hash) (*state.StateDB, error)
+
+	SubscribeChainHeadEvent(ch chan<- core.ChainHeadEvent) event.Subscription
+
+	CurrentHeader() *types.Header
+}
+
+type DTPair struct {
+	token          *common.Address // Target token
+	baseToken      *common.Address // Base token - WETH, USDT, USDC, ...
+	pair           *common.Address
+	owner          *common.Address
+	liquidityOwner *common.Address
+	reserve0       *big.Int // Target token amount in pair
+	reserve1       *big.Int // Base token amount in pair
+	status         int      // 0 - Liquidity added, 1 - Bought, 2 - Closed
+	wallets        []DTAccount
+	rescueWallets  []DTAccount
+	name           string
+	symbol         string
+}
+
+type DTAccount struct {
+	address   common.Address
+	szAddress string
+	key       *ecdsa.PrivateKey
+}
+
+type DTConfig struct {
+	minEthReserve *big.Int
+	minLiquidityUsd *big.Int
+	maxEthReserve *big.Int
+	maxLiquidityUsd *big.Int
+	buyAmount       int64    // percentage
+	maxBuyAmount    *big.Int // Max eth to pay per account
+	buySellCheckCount       uint8    // number of tests to buy and sell
+	buyFee          *big.Int // token max buy fee
+	sellFee         *big.Int // token max sell fee
+	maxBuySlippageInPercent     *big.Int // Buy Slippage percent
+	sellSlippage    *big.Int // Sell Slippage percent
+	// Flags
+	isRunning bool
+	canBuy    bool
+	// Accounts
+	contractAddress  common.Address
+	walletManager DTAccount
+	wallets       []DTAccount
+}
+
+type WatchToken struct {
+	pair             string
+	pendingSwapCount int
+	uniqBuyerCount   int
+	blockNumber      *big.Int
+	maxGasFee        *big.Int
+	maxGasTip        *big.Int
+	amountIns        map[string]string
+	amountOuts       map[string]string
+	bought           bool
+}
+
+type DarkTrader struct {
+	pairs                             map[string]*DTPair
+	watchTokens                       map[string]*WatchToken // token => pair - pairs to watch for actions
+	config                            *DTConfig
+	abiUniswapRouterV2                abi.ABI
+	abiUniswapFactoryV2               abi.ABI
+	abiUniswapUniversalRouter         abi.ABI
+	abiUniswapUniversalRouterInternal abi.ABI
+	abiErc20                          abi.ABI
+	abiWeth                           abi.ABI
+	abiDarkTrader                     abi.ABI
+
+	conf  *Configuration
+	erc20 *Erc20
+
+	db        ethdb.Database
+	bc        blockChain
+	rtConfig  *runtime.Config
+	rpcApis   []rpc.API
+	tracerApi *tracers.API
+	bcApi     *ethapi.BlockChainAPI
+	txApi     *ethapi.TransactionAPI
+
+	txCallConfig *tracers.TraceCallConfig
+
+	swapCache map[string]int
+
+	txCache      map[string]bool
+	txCacheMutex sync.RWMutex
+}
+
+func (dt *DarkTrader) Init(_bc blockChain, _db ethdb.Database, genesis *core.Genesis, _rpcApis []rpc.API, _tracerApi *tracers.API) {
+	fmt.Println("Init DarkTrader...")
+
+	// Default values
+	dt.pairs = make(map[string]*DTPair)
+	dt.watchTokens = make(map[string]*WatchToken)
+
+	//
+	dt.abiUniswapRouterV2, _ = abi.JSON(strings.NewReader(ABI_UNISWAP_ROUTER_V2))
+	dt.abiUniswapFactoryV2, _ = abi.JSON(strings.NewReader(ABI_UNISWAP_FACTORY_V2))
+	dt.abiErc20, _ = abi.JSON(strings.NewReader(ABI_ERC20))
+	dt.abiWeth, _ = abi.JSON(strings.NewReader(ABI_WETH))
+	dt.abiDarkTrader, _ = abi.JSON(strings.NewReader(ABI_DARKTRADER))
+	dt.abiUniswapUniversalRouter, _ = abi.JSON(strings.NewReader(ABI_UNISWAP_UNIVERSAL_ROUTER))
+	dt.abiUniswapUniversalRouterInternal, _ = abi.JSON(strings.NewReader(ABI_UNISWAP_UNIVERSAL_ROUTER_INTERNAL))
+
+	// set config
+	dt.bc = _bc
+	dt.db = _db
+	dt.rpcApis = _rpcApis
+	dt.bcApi = _rpcApis[1].Service.(*ethapi.BlockChainAPI)
+	dt.tracerApi = _tracerApi
+	dt.txApi = _rpcApis[2].Service.(*ethapi.TransactionAPI)
+
+	tracer := "callTracer"
+	dt.txCallConfig = &tracers.TraceCallConfig{
+		TraceConfig: tracers.TraceConfig{
+			Tracer: &tracer,
+			Config: &logger.Config{
+				EnableReturnData: true,
+				EnableMemory:     true,
+				DisableStorage:   true,
+			},
+		},
+	}
+
+	dt.swapCache = make(map[string]int)
+
+	dt.txCache = make(map[string]bool)
+	dt.txCacheMutex = sync.RWMutex{}
+
+	// helper functions
+	dt.erc20 = NewErc20(dt.bcApi)
+	// resume
+	dt.initRedis()
+}
+
+func (dt *DarkTrader) initRedis() {
+	dt.conf = NewConfiguration(dt)
+
+	dt.conf.Init()
+}
+
+func (dt *DarkTrader) pubToRedis(channel string, payload interface{}) {
+	dt.conf.Publish(channel, payload)
+}
+
+func (dt *DarkTrader) setToRedis(key string, payload string) {
+
+}
+
+func (dt *DarkTrader) getFromRedis(key string) string {
+	return ""
+}
+
+func (dt *DarkTrader) start() {
+	fmt.Println("DarkTrader has started...")
+
+	dt.pairs = make(map[string]*DTPair)
+	dt.watchTokens = make(map[string]*WatchToken)
+}
+
+func (dt *DarkTrader) stop() {
+	fmt.Println("DarkTrader has stopped...")
+}
+
+func (dt *DarkTrader) setDarkTraderConfig(config *DTConfig) {
+	fmt.Println("DarkTrader configuration has been updated")
+
+	fmt.Println("          minEthReserve", config.minEthReserve, "maxEthReserve", config.maxEthReserve)
+	fmt.Println("          minLiquidityUsd", config.minLiquidityUsd, "maxLiquidityUsd", config.maxLiquidityUsd)
+	fmt.Println("          buyAmount", config.buyAmount)
+	fmt.Println("          maxBuyAmount", config.maxBuyAmount)
+	fmt.Println("          buySellCheckCount", config.buySellCheckCount)
+	fmt.Println("          fee - buy ", config.buyFee, " sell ", config.sellFee)
+	fmt.Println("          slippage - buy ", config.maxBuySlippageInPercent, " sell ", config.sellSlippage)
+	fmt.Println("          isRunning", config.isRunning)
+	fmt.Println("          canBuy", config.canBuy)
+	fmt.Println("          contractAddress", config.contractAddress)
+	fmt.Println("          walletManager", config.walletManager.szAddress)
+	for i, addr := range config.wallets {
+		fmt.Println("          wallet", i, addr.szAddress)
+	}
+
+	dt.config = config
+	if (dt.config == nil || dt.config.isRunning) && !config.isRunning {
+		dt.stop()
+	} else if (dt.config == nil || !dt.config.isRunning) && config.isRunning {
+		dt.start()
+	}
+	// dt.config = config
+}
+
+func (dt *DarkTrader) ProcessTxs(txs []*types.Transaction) {
+	if dt.config == nil || !dt.config.isRunning {
+		return
+	}
+	for _, tx := range txs {
+		go dt.processTx(tx)()
+	}
+}
+
+func (dt *DarkTrader) parseAddLiquidityInput(szMethod string, from *common.Address, data []byte, value *big.Int) (*DTPair, error) {
+	var pairAddr common.Address
+	method := dt.abiUniswapRouterV2.Methods[szMethod]
+	args, err := method.Inputs.Unpack(data)
+	var pair *DTPair = nil
+	if err != nil {
+		return nil, err
+	}
+	if method.Name == "addLiquidity" {
+		token1 := args[0].(common.Address)
+		token2 := args[1].(common.Address)
+		pairAddr, _ = CalculatePoolAddressV2(token1.Hex(), token2.Hex())
+		owner := args[6].(common.Address)
+		pair = &DTPair{
+			owner:          from,
+			liquidityOwner: &owner,
+			pair:           &pairAddr,
+			status:         0,
+			reserve0:       big.NewInt(0),
+			reserve1:       big.NewInt(0),
+		}
+		if isBaseToken(token2.Hex()) {
+			pair.token = &token1
+			pair.baseToken = &token2
+			pair.reserve0 = args[2].(*big.Int)
+			pair.reserve1 = args[3].(*big.Int)
+		} else if isBaseToken(token1.Hex()) {
+			pair.token = &token2
+			pair.baseToken = &token1
+			pair.reserve0 = args[3].(*big.Int)
+			pair.reserve1 = args[2].(*big.Int)
+		} else {
+			return nil, nil
+		}
+	} else if method.Name == "addLiquidityETH" {
+		owner := args[4].(common.Address)
+		token1 := args[0].(common.Address)
+		pairAddr, _ = CalculatePoolAddressV2(token1.Hex(), WETH_ADDRESS.Hex())
+
+		pair = &DTPair{
+			token:          &token1,
+			baseToken:      &WETH_ADDRESS,
+			pair:           &pairAddr,
+			owner:          from,
+			liquidityOwner: &owner,
+			status:         0,
+			reserve0:       args[1].(*big.Int),
+			reserve1:       value,
+		}
+	}
+
+	// get token name, symbol
+	name, err := dt.erc20.callName(&dt.config.walletManager.address, pair.token, rpc.LatestBlockNumber, nil)
+	pair.name = name
+	symbol, err := dt.erc20.callName(&dt.config.walletManager.address, pair.token, rpc.LatestBlockNumber, nil)
+	pair.symbol = symbol
+	//
+	return pair, nil
+}
+func (dt *DarkTrader) processPendingSwap(tx *types.Transaction, data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	methodSig := data[:4]
+
+	// swapExactTokensForTokens, swapTokensForExactTokens
+	// swapExactETHForTokens, swapETHForExactTokens
+	// swapExactTokensForTokensSupportingFeeOnTransferTokens, swapExactETHForTokensSupportingFeeOnTransferTokens
+	var path []common.Address
+	var amountIn *big.Int
+	var amountOut *big.Int
+	if tx.To().Hex() == v2RouterAddr {
+		if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["swapExactTokensForTokens"].ID) {
+			args, _ := dt.abiUniswapRouterV2.Methods["swapExactTokensForTokens"].Inputs.Unpack(data[4:])
+			if len(args) < 5 {
+				return false
+			}
+			amountIn = args[0].(*big.Int)
+			path = args[2].([]common.Address)
+		} else if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["swapTokensForExactTokens"].ID) {
+			args, _ := dt.abiUniswapRouterV2.Methods["swapTokensForExactTokens"].Inputs.Unpack(data[4:])
+			if len(args) < 5 {
+				return false
+			}
+			amountOut = args[0].(*big.Int)
+			path = args[2].([]common.Address)
+		} else if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["swapExactETHForTokens"].ID) {
+			args, _ := dt.abiUniswapRouterV2.Methods["swapExactETHForTokens"].Inputs.Unpack(data[4:])
+			if len(args) < 4 {
+				return false
+			}
+			amountIn = tx.Value()
+			path = args[1].([]common.Address)
+		} else if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["swapETHForExactTokens"].ID) {
+			args, _ := dt.abiUniswapRouterV2.Methods["swapETHForExactTokens"].Inputs.Unpack(data[4:])
+			if len(args) < 4 {
+				return false
+			}
+			amountOut = args[0].(*big.Int)
+			path = args[1].([]common.Address)
+		} else if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["swapExactTokensForTokensSupportingFeeOnTransferTokens"].ID) {
+			args, _ := dt.abiUniswapRouterV2.Methods["swapExactTokensForTokensSupportingFeeOnTransferTokens"].Inputs.Unpack(data[4:])
+			if len(args) < 5 {
+				return false
+			}
+			amountIn = args[0].(*big.Int)
+			path = args[2].([]common.Address)
+		} else if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["swapExactETHForTokensSupportingFeeOnTransferTokens"].ID) {
+			args, _ := dt.abiUniswapRouterV2.Methods["swapExactETHForTokensSupportingFeeOnTransferTokens"].Inputs.Unpack(data[4:])
+			if len(args) < 4 {
+				return false
+			}
+			amountIn = tx.Value()
+			path = args[1].([]common.Address)
+		}
+	} else if tx.To().Hex() == univRouterAddr {
+		args, _ := dt.abiUniswapUniversalRouter.Methods["execute"].Inputs.Unpack(data[4:])
+		if len(args) < 2 {
+			return false
+		}
+		var (
+			inputs  []interface{}
+			cmdType int
+			err     error
+		)
+		args1 := args[1].([][]byte)
+
+		for idx, cmd := range args[0].([]byte) {
+			if cmd == 8 || cmd == 88 { // V2_SWAP_EXACT_IN
+				inputs, err = dt.abiUniswapUniversalRouterInternal.Methods["v2SwapExactInput"].Inputs.Unpack(args1[idx])
+				if err != nil {
+					return false
+				}
+				cmdType = 8
+				break
+			} else if cmd == 9 || cmd == 99 { // V2_SWAP_EXACT_OUT
+				inputs, err = dt.abiUniswapUniversalRouterInternal.Methods["v2SwapExactOutput"].Inputs.Unpack(args1[idx])
+				if err != nil {
+					return false
+				}
+				cmdType = 9
+				break
+			}
+		}
+		if len(inputs) != 5 {
+			return false
+		}
+		if cmdType == 8 {
+			amountIn = inputs[1].(*big.Int)
+		} else if cmdType == 9 {
+			amountOut = inputs[1].(*big.Int)
+		}
+		path = inputs[3].([]common.Address)
+	} else {
+		return false
+	}
+
+	if len(path) == 2 && path[0].Hex() == "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" {
+		token := path[1].Hex()
+		if len(dt.watchTokens) > 0 {
+			for _token, watchToken := range dt.watchTokens {
+				if _token != token {
+					fmt.Println("[Watch token] Token:", _token, "Pending swap #:", watchToken.pendingSwapCount, "Fee:", watchToken.maxGasFee, "Tip:", watchToken.maxGasTip, "Bought:", watchToken.bought)
+				}
+			}
+			fmt.Println()
+		}
+
+		if watchToken, exists := dt.watchTokens[token]; exists {
+			// find max gas tip
+			gasTip := tx.GasTipCap()
+			if watchToken.maxGasTip.Cmp(gasTip) < 0 {
+				watchToken.maxGasTip = gasTip
+			}
+
+			gasFee := tx.GasFeeCap()
+			if watchToken.maxGasFee.Cmp(gasFee) < 0 {
+				watchToken.maxGasFee = gasFee
+			}
+
+			// check if the same amountIn or amountOut exists
+			if amountIn != nil && amountIn.Cmp(big.NewInt(0)) > 0 {
+				if _, exists := watchToken.amountIns[amountIn.String()]; exists {
+					return false
+				}
+				watchToken.amountIns[amountIn.String()] = tx.Hash().Hex()
+			} else if amountOut != nil && amountOut.Cmp(big.NewInt(0)) > 0 { // check if the same amountOut exists
+				if _, exists := watchToken.amountOuts[amountOut.String()]; exists {
+					return false
+				}
+				watchToken.amountOuts[amountOut.String()] = tx.Hash().Hex()
+			} else {
+				return false
+			}
+
+			if watchToken.pendingSwapCount == 0 {
+				latestBlockNumber := dt.bc.CurrentHeader().Number
+				watchToken.blockNumber = latestBlockNumber
+			}
+
+			watchToken.pendingSwapCount = watchToken.pendingSwapCount + 1
+
+			fmt.Println("[New swap detected] Token:", token, "Amounts:", amountIn, "/", amountOut, "Pending swap #:", watchToken.pendingSwapCount, "Fee:", watchToken.maxGasFee, "Tip:", watchToken.maxGasTip, "Bought:", watchToken.bought)
+
+			// dt.watchTokens[token] = watchToken
+			if watchToken.pendingSwapCount >= 5 && watchToken.bought == false {
+				watchToken.bought = true
+				fmt.Println("[Buy triggered] Token:", token)
+				dt.buy(tx, dt.pairs[watchToken.pair], watchToken, false)
+			}
+		}
+	}
+	return true
+}
+
+func (dt *DarkTrader) parsePendingSwapTx(tx *types.Transaction) bool {
+	return dt.processPendingSwap(tx, tx.Data())
+}
+
+func (dt *DarkTrader) parseInternalPendingSwapTx(tx *types.Transaction) bool {
+
+	return false
+}
+
+func (dt *DarkTrader) processAddLiquidity(tx *types.Transaction, szMethod string, from *common.Address, to *common.Address, data []byte, value *big.Int) (*DTPair, error) {
+	// TODO - Decode byte code and check addLiquidity
+	// 0xe8e33700 - addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin, to, deadline)
+	// 0xf305d719 - addLiquidityETH{value}(token, amountTokenDesired, amountTokenMin, amountETHMin, to, deadline)
+
+	pair, err := dt.parseAddLiquidityInput(szMethod, from, data, value)
+	if err != nil {
+		return nil, err
+	}
+
+	if pair == nil {
+		return nil, nil
+	}
+	_, pairExists := dt.pairs[pair.pair.Hex()]
+
+	if pairExists {
+		return nil, nil
+	}
+
+	if dt.isLiquidityInRange(pair) {
+		return pair, nil
+	}
+
+	// szReserve0 := strings.Split(pair.reserve0.String(), "")
+	// if len(szReserve0) < 3 {
+	// 	return nil, nil
+	// }
+	// for i := 2; i < len(szReserve0); i++ {
+	// 	if szReserve0[i] != "0" {
+	// 		return pair, nil
+	// 	}
+	// }
+
+	// fmt.Println("Liquidity reserve check failed with 0s", pair.token.Hex(), pair.symbol+"("+pair.name+")")
+
+	return nil, nil
+}
+
+func (dt *DarkTrader) tryCallTx(tx *types.Transaction) (interface{}, error) {
+
+	// check gas fee
+	lastBlock := dt.bc.CurrentHeader()
+	prevGasFee := big.NewInt(1).Mul(lastBlock.BaseFee, big.NewInt(875))
+	prevGasFee = prevGasFee.Div(prevGasFee, big.NewInt(1000))
+	if tx.GasFeeCap().Cmp(prevGasFee) < 0 {
+
+		fmt.Println("Gas fee", prevGasFee, tx.GasFeeCap())
+		return nil, errors.New("Gas fee too low")
+	}
+
+	txArg := ethapi.TransactionArgs{}
+
+	txFrom, _ := GetFrom(tx)
+	txArg.From = &txFrom
+	txArg.To = tx.To()
+	txValue := hexutil.Big(*tx.Value())
+	txArg.Value = &txValue
+	txNonce := hexutil.Uint64(tx.Nonce())
+	txArg.Nonce = &txNonce
+	txInput := hexutil.Bytes(tx.Data())
+	txArg.Input = &txInput
+	txChainID := hexutil.Big(*tx.ChainId())
+	txArg.ChainID = &txChainID
+
+	// if tx.Type() == 1 {
+	// 	txArg.GasPrice = (*hexutil.Big)(tx.GasPrice())
+	// } else if tx.Type() == 2 {
+	// 	txArg.MaxFeePerGas = (*hexutil.Big)(tx.GasFeeCap())
+	// 	txArg.MaxPriorityFeePerGas = (*hexutil.Big)(tx.GasTipCap())
+	// }
+
+	result, err := dt.bcApi.Call(context.Background(), txArg, rpc.BlockNumberOrHashWithNumber(rpc.PendingBlockNumber), nil)
+
+	return result, err
+}
+
+func (dt *DarkTrader) processPendingAddLiquidityTx(tx *types.Transaction) bool {
+
+	data := tx.Data()
+	if len(data) < 4 {
+		return false
+	}
+	methodSig := data[:4]
+
+	var (
+		objPair *DTPair
+		err     error
+	)
+
+	from, err := GetFrom(tx)
+
+	if err != nil {
+		return false
+	}
+
+	if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["addLiquidity"].ID) {
+		objPair, err = dt.processAddLiquidity(tx, "addLiquidity", &from, tx.To(), data[4:], tx.Value())
+	} else if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["addLiquidityETH"].ID) {
+		objPair, err = dt.processAddLiquidity(tx, "addLiquidityETH", &from, tx.To(), data[4:], tx.Value())
+	} else {
+		return false
+	}
+
+	if objPair == nil || err != nil {
+		return false
+	}
+
+	_, err = dt.tryCallTx(tx)
+
+	if err != nil {
+		fmt.Println("Pending tx for add liquidity, but failed to execute", err, tx.Hash().Hex())
+		return false
+	}
+
+	// result, err, _ := dt.tryBuy(objPair, tx, true)
+
+	// if err == nil && result {
+	// add to watch list
+	dt.saveOrUpdatePair(*objPair, true)
+	// yup ready to buy
+	// go dt.buy(tx, objPair, false)
+	// }
+
+	return false
+}
+
+func (dt *DarkTrader) processOpenTrading(tx *types.Transaction) bool {
+	data := tx.Data()
+	if len(data) < 4 {
+		return false
+	}
+	methodSig := data[:4]
+
+	if !bytes.Equal(methodSig, []byte{201, 86, 123, 249}) {
+		return false
+	}
+
+	from, err := GetFrom(tx)
+
+	if err != nil {
+		return false
+	}
+
+	var (
+		objPair *DTPair
+	)
+
+	pair, err := CalculatePoolAddressV2(tx.To().Hex(), WETH_ADDRESS.Hex())
+
+	fmt.Println("Try open trading ", tx.Hash().Hex(), tx.To().Hex())
+
+	reserve0, reserve1, err := dt.tryOpenTrading(tx, &pair)
+
+	if err != nil {
+		fmt.Println("Try open trading failed", err)
+		return false
+	}
+
+	objPair = &DTPair{
+		token:          tx.To(),
+		baseToken:      &WETH_ADDRESS,
+		pair:           &pair,
+		owner:          &from,
+		liquidityOwner: &from,
+		status:         0,
+		reserve0:       reserve0,
+		reserve1:       reserve1,
+	}
+
+	if !dt.isLiquidityInRange(objPair) {
+		return false
+	}
+
+	// get token name, symbol
+	name, err := dt.erc20.callName(&dt.config.walletManager.address, objPair.token, rpc.LatestBlockNumber, nil)
+	objPair.name = name
+	symbol, err := dt.erc20.callName(&dt.config.walletManager.address, objPair.token, rpc.LatestBlockNumber, nil)
+	objPair.symbol = symbol
+
+	dt.saveOrUpdatePair(*objPair, true)
+	// dt.buy(tx, objPair, false)
+
+	return true
+}
+
+// func (dt *DarkTrader) processPendingTxLogs(tx *types.Transaction) {
+// 	txArg := ethapi.TransactionArgs{}
+
+// 	txFrom, _ := GetFrom(tx)
+// 	txArg.From = &txFrom
+// 	txArg.To = tx.To()
+// 	txValue := hexutil.Big(*tx.Value())
+// 	txArg.Value = &txValue
+// 	txNonce := hexutil.Uint64(tx.Nonce())
+// 	txArg.Nonce = &txNonce
+// 	txInput := hexutil.Bytes(tx.Data())
+// 	txArg.Input = &txInput
+// 	txChainID := hexutil.Big(*tx.ChainId())
+// 	txArg.ChainID = &txChainID
+
+// 	result, err := dt.tracerApi.TraceCall(
+// 		context.Background(),
+// 		txArg,
+// 		rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber),
+// 		dt.txCallConfig,
+// 	)
+
+// 	if err != nil {
+// 		return
+// 	}
+
+// 	type Log struct {
+// 		Op       string   `json:"op"`
+// 		Memory   []string `json:"memory"`
+// 		Stack    []string `json:"stack"`
+// 		Contract string   `json:"contract"`
+// 	}
+
+// 	type Result struct {
+// 		StructLogs []Log `json:"structLogs"`
+// 	}
+
+// 	var res Result
+// 	resBytes, _ := json.Marshal(result)
+// 	fmt.Println(string(resBytes))
+// 	json.Unmarshal(resBytes, &res)
+
+// 	if len(res.StructLogs) > 0 {
+// 		for _, log := range res.StructLogs {
+// 			if strings.HasPrefix(log.Op, "LOG") {
+// 				topicCount, _ := strconv.Atoi(log.Op[3:])
+
+// 				if topicCount == 3 {
+// 					stackLen := len(log.Stack)
+// 					sender := common.HexToAddress(log.Stack[stackLen-4]).Hex()
+// 					to := common.HexToAddress(log.Stack[stackLen-5]).Hex()
+// 				}
+// 			}
+// 		}
+// 	}
+// }
+
+func (dt *DarkTrader) processTx(tx *types.Transaction) func() {
+	/* TODO
+	 * detect add to blacklist
+	 * detect remove liquidity
+	 * detect approve of pair token on router before removing liquidity
+	 */
+	start := time.Now()
+	emptyReturn := func() {
+	}
+	timedReturn := func() {
+		fmt.Printf("processTx - took %v\n", time.Since(start))
+	}
+
+	dt.txCacheMutex.RLock()
+	_, isProcessed := dt.txCache[tx.Hash().Hex()]
+	dt.txCacheMutex.RUnlock()
+	if isProcessed || tx.To() == nil {
+		return emptyReturn
+	}
+
+	dt.txCacheMutex.Lock()
+	dt.txCache[tx.Hash().Hex()] = true
+	dt.txCacheMutex.Unlock()
+
+	if tx.To().Hex() == v2RouterAddr {
+
+		if dt.parsePendingSwapTx(tx) {
+			return emptyReturn
+		}
+
+		if dt.processPendingAddLiquidityTx(tx) {
+			return timedReturn
+		} else {
+			return emptyReturn
+		}
+	}
+
+	if tx.To().Hex() == univRouterAddr {
+		if dt.parsePendingSwapTx(tx) {
+			return emptyReturn
+		} else {
+			return emptyReturn
+		}
+	}
+
+	watchToken, isWatchingPair := dt.watchTokens[tx.To().Hex()]
+
+	if watchToken == nil {
+		return emptyReturn
+	}
+	szPair := watchToken.pair
+
+	if !isWatchingPair {
+		if dt.processOpenTrading(tx) {
+			return timedReturn
+		} else {
+			dt.parseInternalPendingSwapTx(tx)
+			return timedReturn
+		}
+	}
+
+	objPair, _ := dt.pairs[szPair]
+
+	if objPair == nil {
+		fmt.Println("Pending tx for watching pair found, pair not found")
+		return emptyReturn
+	}
+
+	if objPair.status != 0 {
+		return emptyReturn
+	}
+
+	var (
+		err error
+	)
+
+	_, err = dt.tryCallTx(tx)
+
+	if err != nil {
+		fmt.Println("Pending tx for watching pair found, but failed to execute", objPair.token.Hex(), objPair.symbol+"("+objPair.name+")", err, tx.Hash().Hex())
+		return emptyReturn
+	}
+
+	data := tx.Data()
+	if len(data) < 4 {
+		return emptyReturn
+	}
+	methodSig := data[:4]
+	if bytes.Equal(methodSig, dt.abiErc20.Methods["approve"].ID) || bytes.Equal(methodSig, dt.abiErc20.Methods["transferFrom"].ID) || bytes.Equal(methodSig, dt.abiErc20.Methods["transfer"].ID) || bytes.Equal(methodSig, dt.abiErc20.Methods["transferOwnership"].ID) {
+		return emptyReturn
+	}
+
+	result, err, _ := dt.tryBuy(objPair, tx, true)
+
+	if err == nil && result {
+		// yup ready to buy with enabletrading or opentrading
+		if objPair.status == 0 {
+			// go dt.buy(tx, objPair, false)
+		}
+	} else if err == nil && !result { // else not yet buyable
+		fmt.Println("Pending tx for watching pair found, but failed to try Buy, so keep waiting", objPair.token.Hex(), objPair.symbol+"("+objPair.name+")", err)
+	} else {
+		dt.removePair(*objPair)
+	}
+
+	return timedReturn
+
+	// 	if isWatchingPair {
+	// 		// ignore if method is either of approve, transferFrom, transfer, transferOwnership
+	// 		if bytes.Equal(methodSig, dt.abiErc20.Methods["approve"].ID) || bytes.Equal(methodSig, dt.abiErc20.Methods["transferFrom"].ID) || bytes.Equal(methodSig, dt.abiErc20.Methods["transfer"].ID) || bytes.Equal(methodSig, dt.abiErc20.Methods["transferOwnership"].ID) {
+	// 			return emptyReturn
+	// 		}
+
+	// 		objPair, _ = dt.pairs[szPair]
+	// objPair = nil
+	// from, err = GetFrom(tx)
+	// if err != nil {
+	// 	return emptyReturn
+	// }
+
+	// data := tx.Data()
+	// if len(data) < 4 {
+	// 	return emptyReturn
+	// }
+	// methodSig := data[:4]
+	// if tx.To() != nil && tx.To().Hex() == v2RouterAddr {
+	// 	if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["addLiquidity"].ID) {
+	// 		objPair, err = dt.processAddLiquidity(tx, "addLiquidity", &from, tx.To(), data[4:], tx.Value())
+	// 	} else if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["addLiquidityETH"].ID) {
+	// 		objPair, err = dt.processAddLiquidity(tx, "addLiquidityETH", &from, tx.To(), data[4:], tx.Value())
+	// 	} else {
+	// 		return emptyReturn
+	// 	}
+	// 	if objPair != nil {
+	// 		dt.saveOrUpdatePair(*objPair, true)
+	// 	}
+	// 	isAddLiquidity = true
+	// } else if tx.To() != nil {
+	// 	szPair, isWatchingPair := dt.watchTokens[from.Hex()+tx.To().Hex()]
+	// 	if isWatchingPair {
+	// 		// ignore if method is either of approve, transferFrom, transfer, transferOwnership
+	// 		if bytes.Equal(methodSig, dt.abiErc20.Methods["approve"].ID) || bytes.Equal(methodSig, dt.abiErc20.Methods["transferFrom"].ID) || bytes.Equal(methodSig, dt.abiErc20.Methods["transfer"].ID) || bytes.Equal(methodSig, dt.abiErc20.Methods["transferOwnership"].ID) {
+	// 			return emptyReturn
+	// 		}
+
+	// 		objPair, _ = dt.pairs[szPair]
+	// 	} else {
+	// 		// track sub calls for addLiquidity
+	// 	}
+	// 	isAddLiquidity = false
+	// }
+	// if objPair == nil {
+	// 	return emptyReturn
+	// }
+
+	// scamResult, err := dt.checkScam(tx, objPair, isAddLiquidity, true)
+
+	// if err != nil {
+	// 	return timedReturn
+	// }
+	// if scamResult == 0 {
+	// 	// buy
+	// 	dt.buy(tx, objPair, isAddLiquidity)
+	// } else if scamResult == 1 {
+	// 	// scam, delete
+	// 	dt.removePair(*objPair)
+	// } else if scamResult == 2 {
+	// 	// ignore for now
+	// }
+}
+
+func (dt *DarkTrader) CheckEventLogs(head *types.Block, logs []*types.Log) bool {
+	if !dt.config.isRunning {
+		return false
+	}
+
+	latestBlockNumber := dt.bc.CurrentHeader().Number
+	for token, watchToken := range dt.watchTokens {
+		if watchToken.pendingSwapCount > 0 {
+			dt.swapCache[token] = watchToken.pendingSwapCount
+			fmt.Println(token, "Blk", watchToken.blockNumber, "Swaps", watchToken.pendingSwapCount, "Buyers", watchToken.uniqBuyerCount)
+			// fmt.Println("  ", watchToken.amountIns)
+			// fmt.Println("  ", watchToken.amountOuts)
+		}
+
+		if watchToken.bought == true || (watchToken.blockNumber != nil && latestBlockNumber.Cmp(watchToken.blockNumber) > 0) {
+			delete(dt.watchTokens, token)
+		}
+	}
+
+	txs := head.Transactions()
+	for _, tx := range txs {
+		receipt, err := dt.txApi.GetTransactionReceipt(context.Background(), tx.Hash())
+		if err != nil {
+			continue
+		}
+		txStatus, exists := receipt["status"]
+		if exists && uint(txStatus.(hexutil.Uint)) != 1 {
+			continue
+		}
+		var (
+			objPair *DTPair = nil
+		)
+
+		from, err := GetFrom(tx)
+		if err != nil {
+			continue
+		}
+
+		data := tx.Data()
+		if len(data) < 4 {
+			continue
+		}
+		methodSig := data[:4]
+		if tx.To() != nil && tx.To().Hex() == v2RouterAddr {
+			if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["addLiquidity"].ID) {
+				objPair, err = dt.processAddLiquidity(tx, "addLiquidity", &from, tx.To(), data[4:], tx.Value())
+			} else if bytes.Equal(methodSig, dt.abiUniswapRouterV2.Methods["addLiquidityETH"].ID) {
+				objPair, err = dt.processAddLiquidity(tx, "addLiquidityETH", &from, tx.To(), data[4:], tx.Value())
+			} else {
+				continue
+			}
+		} else {
+			continue
+		}
+		if objPair == nil {
+			continue
+		}
+
+		fmt.Println("Token ", objPair.token.Hex(), objPair.symbol+"("+objPair.name+")", tx.Hash().Hex())
+		_, err, _ = dt.tryBuy(objPair, nil, false)
+
+		if err == nil {
+			// if !result {
+			// can't buy after add liquidity, add to watch list
+			dt.saveOrUpdatePair(*objPair, true)
+			fmt.Println("Darktrader - start watching - ", objPair.token.Hex())
+			// } else {
+			// fmt.Println("Can buy right now, so ignore")
+			// }
+		} else {
+			fmt.Println("Failed ", err)
+		}
+
+	}
+
+	return true
+}
+
+func (dt *DarkTrader) saveOrUpdatePair(pair DTPair, rewriteExisting bool) {
+	var ok bool
+	_, ok = dt.pairs[pair.pair.Hex()]
+
+	dt.watchTokens[pair.token.Hex()] = &WatchToken{pair: pair.pair.Hex(), pendingSwapCount: 0, uniqBuyerCount: 0, maxGasTip: big.NewInt(0), maxGasFee: big.NewInt(0), amountIns: map[string]string{}, amountOuts: map[string]string{}, bought: false}
+	if ok && !rewriteExisting {
+		return
+	}
+	dt.pairs[pair.pair.Hex()] = &pair
+}
+
+func (dt *DarkTrader) removePair(pair DTPair) {
+	var ok bool
+	_, ok = dt.watchTokens[pair.token.Hex()]
+	if ok {
+		delete(dt.watchTokens, pair.token.Hex())
+	}
+
+	_, ok = dt.pairs[pair.pair.Hex()]
+	if ok {
+		delete(dt.pairs, pair.pair.Hex())
+	}
+}
+
+func (dt *DarkTrader) balanceOf(token *common.Address, addr *common.Address, blockNumber rpc.BlockNumber) (*big.Int, error) {
+
+	input, err := dt.abiErc20.Pack("balanceOf", addr)
+
+	if err != nil {
+		return nil, err
+	}
+	hexInput := hexutil.Bytes(input)
+	res, err := dt.bcApi.Call(context.Background(), ethapi.TransactionArgs{
+		From:  &dt.config.walletManager.address,
+		To:    token,
+		Input: &hexInput,
+	}, rpc.BlockNumberOrHashWithNumber(blockNumber),
+		nil)
+
+	if err != nil {
+		return nil, err
+	}
+
+	output, err := dt.abiErc20.Methods["balanceOf"].Outputs.Unpack(res)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(output) == 0 {
+		return nil, fmt.Errorf("Unexpected output of balanceOf")
+	}
+
+	balance := output[0].(*big.Int)
+
+	return balance, nil
+}
+
+func (dt *DarkTrader) buildBalanceOfTx(token *common.Address, addr *common.Address) (*ethapi.TransactionArgs, error) {
+
+	input, err := dt.abiErc20.Pack("balanceOf", addr)
+
+	if err != nil {
+		return nil, err
+	}
+	hexInput := hexutil.Bytes(input)
+
+	arg := ethapi.TransactionArgs{
+		From:  &dt.config.walletManager.address,
+		To:    token,
+		Input: &hexInput,
+	}
+
+	return &arg, nil
+}
+
+func (dt *DarkTrader) parseBalanceOfOutput(res hexutil.Bytes) (*big.Int, error) {
+	output, err := dt.abiErc20.Methods["balanceOf"].Outputs.Unpack(res)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(output) == 0 {
+		return nil, fmt.Errorf("Unexpected output of balanceOf")
+	}
+
+	balance := output[0].(*big.Int)
+
+	return balance, nil
+}
+
+func (dt *DarkTrader) tryBuyPending(pair *DTPair, tx *types.Transaction) (bool, error, *big.Int) {
+
+	buyAmount, _ := CalcBuyAmountAndCount(*pair, dt.config)
+
+	var batchCallConfig = ethapi.BatchCallConfig{
+		Block: rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber),
+		Calls: make([]ethapi.BatchCallArgs, 3),
+	}
+
+	txChainID := hexutil.Big(*tx.ChainId())
+
+	txFrom, _ := GetFrom(tx)
+	txValue := hexutil.Big(*tx.Value())
+	txInput := hexutil.Bytes(tx.Data())
+	batchCallConfig.Calls[0] = ethapi.BatchCallArgs{
+		TransactionArgs: ethapi.TransactionArgs{
+			From:    &txFrom,
+			To:      tx.To(),
+			Value:   &txValue,
+			Input:   &txInput,
+			ChainID: &txChainID,
+		},
+	}
+
+	// balanceOf on pair- to check I'm too late
+	txBalanceOfArg, err := dt.buildBalanceOfTx(pair.baseToken, pair.pair)
+	if err != nil {
+		fmt.Println("Error in try buy - last balance of liquidity ", err, pair.token.Hex(), pair.symbol+"("+pair.name+")")
+		return false, err, nil
+	}
+	batchCallConfig.Calls[1] = ethapi.BatchCallArgs{
+		TransactionArgs: *txBalanceOfArg,
+	}
+
+	// swap
+	testMngBalance1 := hexutil.Big(*AMOUNT_100)
+	testMngBalance := &testMngBalance1
+	testDepositValue := hexutil.Big(*AMOUNT_99)
+
+	overridesMap := map[common.Address]ethapi.OverrideAccount{}
+	overridesMap[dt.config.walletManager.address] = ethapi.OverrideAccount{
+		Balance: &testMngBalance,
+	}
+	// //function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+	// path, _ := BuildSwapPath(pair)
+	// txInput0Bytes, err := dt.abiUniswapRouterV2.Pack("swapETHForExactTokens", buyAmount, *path, dt.config.walletManager.address, big.NewInt(time.Now().Unix()+100000))
+	// if err != nil {
+	// 	fmt.Println("Error in try buy - ", err)
+	// 	return false, err, nil
+	// }
+	// txInput0 := hexutil.Bytes(txInput0Bytes)
+
+	// batchCallConfig.Calls[2] = ethapi.BatchCallArgs{
+	// 	TransactionArgs: ethapi.TransactionArgs{
+	// 		From:  &dt.config.walletManager.address,
+	// 		To:    &v2RouterAddrObj,
+	// 		Value: &testDepositValue,
+	// 		Input: &txInput0,
+	// 	},
+	// }
+	// function buyAndSell(address token0, address token1, uint amount, uint8 count, uint deadline) external payable returns(uint, uint, uint) {
+
+	txInput0Bytes, err := dt.abiDarkTrader.Pack("buyAndSell", pair.baseToken, pair.token, buyAmount, uint8(1), big.NewInt(time.Now().Unix()+100000))
+	if err != nil {
+		fmt.Println("Error in try buy - ", err)
+		return false, err, nil
+	}
+	txInput0 := hexutil.Bytes(txInput0Bytes)
+
+	batchCallConfig.Calls[2] = ethapi.BatchCallArgs{
+		TransactionArgs: ethapi.TransactionArgs{
+			From:  &dt.config.walletManager.address,
+			To:    &dt.config.contractAddress,
+			Value: &testDepositValue,
+			Input: &txInput0,
+		},
+	}
+
+	overrides := ethapi.StateOverride(overridesMap)
+	batchCallConfig.StateOverrides = &overrides
+
+	results, err := dt.bcApi.BatchCall(context.Background(), batchCallConfig)
+	if err != nil {
+		return false, err, nil
+	}
+	fmt.Println("results - ", results, tx.Hash().Hex())
+	// if results[0].Error != nil {
+	// 	return false, results[0].Error, nil
+	// }
+	// if results[2].Error != nil {
+	// 	return false, results[2].Error, nil
+	// }
+
+	var balanceAfterBuy *big.Int = nil
+	if results[1].Error == nil {
+		// check whether I'm too late
+		balanceAfter, err := dt.parseBalanceOfOutput(results[1].Return)
+		if err != nil {
+			fmt.Println("Error in try buy - last balance of pair parse output error", err)
+			return false, err, nil
+		}
+		if balanceAfter.Cmp(pair.reserve1) != 0 {
+			fmt.Println("Error in try buy - too late to buy", pair.token.Hex(), pair.symbol+"("+pair.name+")")
+			return false, errors.New("Too late to buy this token"), nil
+		}
+	}
+
+	if results[0].Error != nil {
+		return false, nil, nil
+	}
+	if results[2].Error != nil {
+		if !strings.Contains(results[2].Error.Error(), "UniswapV2: K") {
+			return false, nil, nil
+		} else {
+			// have swapBack honeypot
+			return false, results[2].Error, nil
+		}
+	}
+
+	if results[2].Error == nil {
+		// check buy, sell fee
+		buyAndSellOutput, err := dt.abiDarkTrader.Methods["buyAndSell"].Outputs.Unpack(results[2].Return)
+		if err != nil {
+			fmt.Println("Error in try buy - buyAndSell parse output error", err)
+			return false, err, nil
+		}
+		fmt.Println("BuyAndSell result", buyAndSellOutput)
+
+		actualAmountBought := buyAndSellOutput[1].(*big.Int)
+		actualAmountIn := buyAndSellOutput[1].(*big.Int)
+		actualAmountOut := buyAndSellOutput[2].(*big.Int)
+
+		if actualAmountBought.Cmp(buyAmount) >= 0 {
+			// no buy fee - scam
+			return false, errors.New("No buy fee, almost a scam"), nil
+		}
+
+		// Check slippage
+		slippage := big.NewInt(1)
+		slippage = slippage.Mul(actualAmountOut, big.NewInt(100))
+		slippage = slippage.Div(slippage, actualAmountIn)
+		fmt.Println("Slippage - ", slippage, tx.Hash().Hex())
+		if slippage.Cmp(dt.config.sellSlippage) < 0 {
+			// Scam Remove
+			return false, errors.New("Sell slippage too high than configured value"), nil
+		}
+	}
+
+	// if balanceAfter.Cmp(pair.reserve0) != 0 {
+	// 	fmt.Println("Error in try buy - too late to buy", pair.token.Hex())
+	// 	return false, errors.New("Too late to buy this token")
+	// }
+
+	return true, nil, balanceAfterBuy
+}
+
+func (dt *DarkTrader) tryBuy(pair *DTPair, tx *types.Transaction, isPending bool) (bool, error, *big.Int) {
+	if isPending {
+		return dt.tryBuyPending(pair, tx)
+	}
+	buyAmount, _ := CalcBuyAmountAndCount(*pair, dt.config)
+
+	testMngBalance1 := hexutil.Big(*AMOUNT_100)
+	testMngBalance := &testMngBalance1
+	testDepositValue := hexutil.Big(*AMOUNT_99)
+
+	overridesMap := map[common.Address]ethapi.OverrideAccount{}
+	overridesMap[dt.config.walletManager.address] = ethapi.OverrideAccount{
+		Balance: &testMngBalance,
+	}
+	//function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+	path, _ := BuildSwapPath(pair)
+	txInput0Bytes, err := dt.abiUniswapRouterV2.Pack("swapETHForExactTokens", buyAmount, path, dt.config.walletManager.address, big.NewInt(time.Now().Unix()+100000))
+	if err != nil {
+		fmt.Println("Error in try buy - ", err)
+		return false, err, nil
+	}
+	txInput0 := hexutil.Bytes(txInput0Bytes)
+
+	txArg := ethapi.TransactionArgs{
+		From:  &dt.config.walletManager.address,
+		To:    &v2RouterAddrObj,
+		Value: &testDepositValue,
+		Input: &txInput0,
+	}
+
+	overrides := ethapi.StateOverride(overridesMap)
+
+	_, err = dt.bcApi.Call(context.Background(), txArg, rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber), &overrides)
+
+	if err != nil {
+		fmt.Println("swap error", err, pair.token.Hex())
+		return false, nil, nil
+	}
+	return true, nil, nil
+}
+func (dt *DarkTrader) checkScam(tx *types.Transaction, pair *DTPair, isAddLiquidity bool, isPending bool) (int, error) {
+	// var (
+	// 	i int
+	// )
+
+	// Check whether the addLiquidity of old pair
+	balance0, err := dt.balanceOf(pair.token, pair.pair, rpc.LatestBlockNumber)
+	if err != nil {
+		return 0, err // Error
+	}
+
+	if isAddLiquidity && balance0.Cmp(big.NewInt(0)) != 0 {
+		return 1, nil // Remove - Liquidity is too old
+	} else if !isAddLiquidity && balance0.Cmp(pair.reserve0) != 0 {
+		return 1, nil // Remove - too late - someone already bought, we missed the enable trading tx
+	}
+
+	buyAmount, _ := CalcBuyAmountAndCount(*pair, dt.config)
+
+	fmt.Println("TestBuying... - ", "token", pair.token, pair.symbol+"("+pair.name+")", pair.reserve0, "base", pair.baseToken, pair.reserve1, "buyAmount", buyAmount)
+
+	// try buy and sell
+	var batchCallConfig = ethapi.BatchCallConfig{
+		Block: rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber),
+	}
+
+	txChainID := hexutil.Big(*tx.ChainId())
+	tryCallIndex := 0
+	if isPending {
+		batchCallConfig.Calls = make([]ethapi.BatchCallArgs, 2)
+		tryCallIndex = 1
+
+		txFrom, _ := GetFrom(tx)
+		txValue := hexutil.Big(*tx.Value())
+		txInput := hexutil.Bytes(tx.Data())
+		batchCallConfig.Calls[0] = ethapi.BatchCallArgs{
+			TransactionArgs: ethapi.TransactionArgs{
+				From:    &txFrom,
+				To:      tx.To(),
+				Value:   &txValue,
+				Input:   &txInput,
+				ChainID: &txChainID,
+			},
+		}
+	} else {
+		batchCallConfig.Calls = make([]ethapi.BatchCallArgs, 1)
+		tryCallIndex = 0
+	}
+
+	// original tx
+
+	// Buy and sell
+	// function buyAndSell(address token0, address token1, uint amount, uint8 count, uint deadline) external payable returns(uint actualAmountOut, uint actualFinalProfit)
+
+	testMngBalance1 := hexutil.Big(*AMOUNT_100)
+	testMngBalance := &testMngBalance1
+	testDepositValue := hexutil.Big(*AMOUNT_99)
+
+	overridesMap := map[common.Address]ethapi.OverrideAccount{}
+	overridesMap[dt.config.walletManager.address] = ethapi.OverrideAccount{
+		Balance: &testMngBalance,
+	}
+	txInput0Bytes, err := dt.abiDarkTrader.Pack("buyAndSell", pair.baseToken, pair.token, buyAmount, dt.config.buySellCheckCount, big.NewInt(time.Now().Unix()+100000))
+	if err != nil {
+		return 0, err
+	}
+	txInput0 := hexutil.Bytes(txInput0Bytes)
+	batchCallConfig.Calls[tryCallIndex] = ethapi.BatchCallArgs{
+		TransactionArgs: ethapi.TransactionArgs{
+			From:    &dt.config.walletManager.address,
+			To:      &dt.config.contractAddress,
+			Value:   &testDepositValue,
+			Input:   &txInput0,
+			ChainID: &txChainID,
+		},
+	}
+	overrides := ethapi.StateOverride(overridesMap)
+	batchCallConfig.StateOverrides = &overrides
+
+	result, err := dt.bcApi.BatchCall(context.Background(), batchCallConfig)
+	if err != nil {
+		fmt.Println("CheckScam - TryBuySell Call Error", err, result, tx.Hash().Hex())
+		return 0, err
+	}
+	output, err := dt.abiDarkTrader.Methods["buyAndSell"].Outputs.Unpack(result[1].Return)
+	if len(output) != 3 {
+		fmt.Println("CheckScam - TryBuySell Output Unpack error", result)
+		return 0, result[1].Error
+	}
+
+	actualAmountBought := output[1].(*big.Int)
+	actualAmountIn := output[1].(*big.Int)
+	actualAmountOut := output[2].(*big.Int)
+
+	if actualAmountBought.Cmp(buyAmount) >= 0 {
+		// no buy fee - scam
+		return 1, nil
+	}
+
+	// Check slippage
+	slippage := big.NewInt(1)
+	slippage = slippage.Mul(actualAmountOut, big.NewInt(100))
+	slippage = slippage.Div(slippage, actualAmountIn)
+	fmt.Println("Slippage - ", slippage, tx.Hash().Hex())
+	if slippage.Cmp(dt.config.sellSlippage) < 0 {
+		// Scam Remove
+		return 1, nil
+	}
+
+	fmt.Println("CheckScam - TryBuySell Result", output, slippage)
+	return 0, nil
+}
+
+func (dt *DarkTrader) calcAmountInMax(pair *DTPair, amount *big.Int, num int) *big.Int {
+	amountInMax := big.NewInt(1)
+
+	reserve0 := big.NewInt(1)
+	*reserve0 = *pair.reserve0
+	reserve1 := big.NewInt(1)
+	*reserve1 = *pair.reserve1
+
+	for i := 0; i < num; i++ {
+		numerator := big.NewInt(1)
+		numerator = numerator.Mul(reserve1, amount)
+		numerator = numerator.Mul(numerator, big.NewInt(1000))
+		denominator := big.NewInt(1)
+		denominator = denominator.Sub(reserve0, amount)
+		denominator = denominator.Mul(denominator, big.NewInt(997))
+
+		amountInMax = amountInMax.Div(numerator, denominator)
+		amountInMax = amountInMax.Add(amountInMax, big.NewInt(1))
+
+		reserve0 = reserve0.Sub(reserve0, amount)
+		reserve1 = reserve1.Add(reserve1, amountInMax)
+	}
+
+	// uint numerator = reserveIn.mul(amountOut).mul(1000);
+	// uint denominator = reserveOut.sub(amountOut).mul(997);
+	// amountIn = (numerator / denominator).add(1);
+
+	amountInMax = amountInMax.Mul(amountInMax, dt.config.maxBuySlippageInPercent)
+	amountInMax = amountInMax.Div(amountInMax, big.NewInt(100))
+
+	return amountInMax
+}
+
+func (dt *DarkTrader) updatePairInfo(pair *DTPair) {
+	reserve0, err := dt.balanceOf(pair.token, pair.pair, rpc.LatestBlockNumber)
+	if err != nil || reserve0.Cmp(big.NewInt(0)) == 0 {
+		return
+	}
+	reserve1, err := dt.balanceOf(pair.baseToken, pair.pair, rpc.LatestBlockNumber)
+	if err != nil || reserve1.Cmp(big.NewInt(0)) == 0 {
+		return
+	}
+	pair.reserve0 = reserve0
+	pair.reserve1 = reserve1
+
+	dt.saveOrUpdatePair(*pair, true)
+}
+
+func (dt *DarkTrader) buy(tx *types.Transaction, pair *DTPair, watchToken *WatchToken, isAddLiquidity bool) (int, error) {
+	if pair.status != 0 {
+		return 0, nil
+	}
+	dt.updatePairInfo(pair)
+	buyAmount, buyCount := CalcBuyAmountAndCount(*pair, dt.config)
+	fmt.Println("Buying... - ", "token", pair.token, pair.reserve0, pair.symbol+"("+pair.name+")", "base", pair.baseToken, pair.reserve1, "buyAmount", buyAmount, "Count", buyCount, "isAddLiquidity", isAddLiquidity, "Tx", tx.Hash().Hex())
+
+	fmt.Println("Pending swap #:", watchToken.pendingSwapCount, "Fee:", watchToken.maxGasFee, "Tip:", watchToken.maxGasTip)
+
+	path, _ := BuildSwapPath(pair)
+
+	fmt.Println(dt.config.wallets)
+	if buyCount > len(dt.config.wallets) {
+		buyCount = len(dt.config.wallets)
+	}
+
+	boughtAccounts := make([]string, buyCount)
+	boughtTxs := make([]string, buyCount)
+	j := 0
+
+	for i := 0; i < buyCount; i++ {
+		amountInMax := dt.calcAmountInMax(pair, buyAmount, i+1)
+		accounts := make([]common.Address, 1)
+		accounts[0] = dt.config.wallets[i].address
+		// function buy(address[] calldata path, uint amount, uint amountInMax, address[] calldata wallets, uint deadline) external onlyOwner
+		txPayloadInput, err := dt.abiDarkTrader.Pack("buy", path, buyAmount, amountInMax, accounts, big.NewInt(time.Now().Unix()+20))
+
+		if err != nil {
+			fmt.Println("Error in buy", err)
+			continue
+		}
+
+		// FIXME: nonce check failed(jaguar)
+		// nonce, err := dt.txApi.GetTransactionCount(context.Background(), accounts[0], rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber))
+		// if err != nil {
+		// 	fmt.Println("Error in get nonce", err)
+		// 	continue
+		// }
+		nonce1, err := dt.txApi.GetTransactionCount(context.Background(), accounts[0], rpc.BlockNumberOrHashWithNumber(rpc.PendingBlockNumber))
+		if err != nil {
+			fmt.Println("Error in get nonce", err)
+			continue
+		}
+
+		// if nonce1 != nonce {
+		// 	fmt.Println("There's a pending transaction for this account", dt.config.wallets[i].address)
+		// 	continue
+		// }
+		// max priority fee per gas higher than max fee per gas
+		var maxGas uint64 = 1000000
+		// maxPrice := tx.GasTipCap()
+
+		// maxGasFee, big.NewInt(100000000))
+		gasTip := big.NewInt(50000000000)
+		gasFee := big.NewInt(250000000000)
+		fmt.Println("Fee:", gasFee, "Tip:", gasTip)
+		dft := types.DynamicFeeTx{
+			ChainID:   tx.ChainId(),
+			Nonce:     uint64(*nonce1),
+			GasTipCap: gasTip,
+			GasFeeCap: gasFee,
+			Gas:       maxGas,
+			To:        &dt.config.contractAddress,
+			Value:     big.NewInt(0),
+			Data:      txPayloadInput,
+		}
+
+		fmt.Println(dft)
+		tx := types.NewTx(
+			types.TxData(&dft),
+		)
+
+		signedTx, err := types.SignTx(tx, types.LatestSignerForChainID(tx.ChainId()), dt.config.wallets[i].key)
+		if err != nil {
+			fmt.Println("Error in signing tx", err)
+			continue
+		}
+
+		txPayload, _ := signedTx.MarshalBinary()
+
+		if !dt.config.canBuy {
+			fmt.Println("Buy not enabled")
+			return 0, nil
+		} else {
+			fmt.Println(txPayload)
+			txHash, err := dt.txApi.SendRawTransaction(context.Background(), txPayload)
+
+			if err != nil {
+				fmt.Println("Error in sending raw tx", err)
+				fmt.Println("      input payload ", hexutils.BytesToHex(txPayloadInput), "txPayload", txPayload)
+				fmt.Println("      path", path, "amountInMax", amountInMax)
+
+				boughtAccounts[j] = dt.config.wallets[i].szAddress
+				boughtTxs[j] = txHash.Hex()
+				j++
+			}
+		}
+	}
+
+	if len(boughtTxs) > 0 {
+		msg := PairBoughtEvent{
+			token0:          pair.token.Hex(),
+			token1:          pair.baseToken.Hex(),
+			pair:            pair.pair.Hex(),
+			owner:           pair.owner.Hex(),
+			liquidity_owner: pair.liquidityOwner.Hex(),
+			accounts:        boughtAccounts,
+			txs:             boughtTxs,
+		}
+		go dt.pubToRedis("channel:token-bought", msg)
+	}
+
+	pair.status = 1
+
+	dt.saveOrUpdatePair(*pair, true)
+
+	return 0, nil
+}
+
+func (dt *DarkTrader) isLiquidityInRange(pair *DTPair) bool {
+	if pair.baseToken.Hex() == "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" && pair.reserve1.Cmp(dt.config.minEthReserve) < 0 {
+		return false // Remove cause too small
+	} else if pair.baseToken.Hex() != "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" && pair.reserve1.Cmp(dt.config.minLiquidityUsd) < 0 {
+		return false // Remove cause too small
+	}
+	//  else if pair.baseToken.Hex() == "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" && pair.reserve1.Cmp(dt.config.maxEthReserve) > 0 {
+	// 	return false // Remove cause too large
+	// } else if pair.baseToken.Hex() != "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" && pair.reserve1.Cmp(dt.config.maxLiquidityUsd) > 0 {
+	// 	return false // Remove cause too large
+	// }
+	return true
+}
+
+func (dt *DarkTrader) tryOpenTrading(tx *types.Transaction, pair *common.Address) (*big.Int, *big.Int, error) {
+	reserve0 := big.NewInt(0)
+	reserve1 := big.NewInt(0)
+
+	var batchCallConfig = ethapi.BatchCallConfig{
+		Block: rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber),
+		Calls: make([]ethapi.BatchCallArgs, 3),
+	}
+
+	txChainID := hexutil.Big(*tx.ChainId())
+
+	txFrom, _ := GetFrom(tx)
+	txValue := hexutil.Big(*tx.Value())
+	txInput := hexutil.Bytes(tx.Data())
+	batchCallConfig.Calls[0] = ethapi.BatchCallArgs{
+		TransactionArgs: ethapi.TransactionArgs{
+			From:    &txFrom,
+			To:      tx.To(),
+			Value:   &txValue,
+			Input:   &txInput,
+			ChainID: &txChainID,
+		},
+	}
+
+	// balanceOf on pair- to check I'm too late
+	txBalanceOfArg, err := dt.buildBalanceOfTx(&WETH_ADDRESS, pair)
+	if err != nil {
+		return reserve0, reserve1, err
+	}
+	batchCallConfig.Calls[1] = ethapi.BatchCallArgs{
+		TransactionArgs: *txBalanceOfArg,
+	}
+
+	// balanceOf on pair- to check I'm too late
+	txBalanceOfArg1, err := dt.buildBalanceOfTx(tx.To(), pair)
+	if err != nil {
+		return reserve0, reserve1, err
+	}
+	batchCallConfig.Calls[2] = ethapi.BatchCallArgs{
+		TransactionArgs: *txBalanceOfArg1,
+	}
+
+	// call
+
+	results, err := dt.bcApi.BatchCall(context.Background(), batchCallConfig)
+
+	if err != nil {
+		return reserve0, reserve1, err
+	}
+
+	for _, result := range results {
+		if result.Error != nil {
+			return reserve0, reserve1, result.Error
+		}
+	}
+	reserve1, err = dt.parseBalanceOfOutput(results[1].Return)
+	if err != nil {
+		return reserve0, reserve1, err
+	}
+	reserve0, err = dt.parseBalanceOfOutput(results[2].Return)
+	if err != nil {
+		return reserve0, reserve1, err
+	}
+
+	return reserve0, reserve1, nil
+}
